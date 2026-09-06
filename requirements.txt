@@ -1,0 +1,24 @@
+# SynapseMind (突触脑) 生产依赖清单
+# Python 3.11+ / FastAPI 单 Worker 架构
+
+# --- 图引擎与拓扑计算 ---
+kuzu>=0.4.0            # 嵌入式 C++ 图引擎 (长期拓扑记忆皮层)
+rustworkx>=0.14.0      # Rust 底座高性能图计算 (阻尼能量扩散)
+scipy>=1.11.0          # 科学计算辅助 (能量扩散数值处理)
+
+# --- 术语相近度弱提示 (仅提示，严禁自动合并) ---
+rapidfuzz>=3.6.0       # 高性能模糊字符串相似度
+
+# --- Web 服务框架 ---
+fastapi>=0.110.0       # 服务入口框架
+uvicorn>=0.29.0        # ASGI 服务器 (单 Worker 模式)
+jinja2>=3.1.0          # HTML 模板渲染
+python-multipart>=0.0.9  # 表单解析
+
+# --- 存储与灾备 ---
+boto3>=1.34.0          # S3 兼容对象存储 (AWS S3 / R2 / OSS / MinIO)
+apscheduler>=3.10.0    # 后台定时任务 (每小时/每日快照轮转)
+
+# --- LLM 代谢器与安全 ---
+httpx>=0.27.0          # 异步 HTTP 客户端 (LLM API 调用)；注：httpx 主线版本为 0.x，原 1.27.0 为笔误
+passlib>=1.7.4         # 访问密码哈希

@@ -1,0 +1,638 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>控制台 - SynapseMind</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      min-height: 100vh;
+      background: radial-gradient(1200px 600px at 20% -10%, #1b2a4a 0%, #0b1120 55%, #070b14 100%);
+      font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+      color: #e5eaf5;
+      padding: 28px 16px 60px;
+    }
+    .wrap { max-width: 920px; margin: 0 auto; }
+    header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 26px;
+    }
+    .logo { font-size: 20px; font-weight: 700; letter-spacing: 1px; }
+    .logo .accent { color: #6f9bff; }
+    nav { display: flex; align-items: center; gap: 14px; }
+    nav a { color: #8fa3c8; text-decoration: none; font-size: 13px; }
+    nav a:hover { color: #cdd9f2; }
+    nav form { display: inline; }
+    .card {
+      background: rgba(17, 24, 39, .85);
+      border: 1px solid rgba(99, 132, 255, .18);
+      border-radius: 12px;
+      padding: 22px 24px;
+      margin-bottom: 18px;
+    }
+    .card h2 {
+      font-size: 15px; font-weight: 600; color: #9fc0ff;
+      margin-bottom: 14px; letter-spacing: .5px;
+    }
+    label { display: block; font-size: 12px; color: #aab4c8; margin-bottom: 5px; }
+    input[type="text"], input[type="password"] {
+      width: 100%; padding: 9px 11px; font-size: 13px; color: #eef2ff;
+      background: #0d1425; border: 1px solid #2a3a5e; border-radius: 8px; outline: none;
+    }
+    input:focus { border-color: #6f9bff; }
+    input[type="range"] { width: 100%; accent-color: #6f9bff; }
+    button {
+      padding: 8px 16px; font-size: 13px; font-weight: 600; color: #fff;
+      background: linear-gradient(135deg, #3b6cf0, #6f9bff);
+      border: none; border-radius: 8px; cursor: pointer;
+    }
+    button:hover { filter: brightness(1.12); }
+    button.ghost { background: #1a2540; border: 1px solid #33477a; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+    .row > div { flex: 1 1 180px; }
+    .actions { margin-top: 14px; display: flex; gap: 10px; align-items: center; }
+    .msg { font-size: 12px; margin-left: 6px; }
+    .msg.ok { color: #7fe3a0; }
+    .msg.err { color: #ff9b9b; }
+    .empty { color: #5d6782; font-size: 12px; padding: 6px 0; }
+    .cond-row { display: flex; gap: 8px; margin-bottom: 8px; align-items: center; }
+    .cond-row input { flex: 1; }
+    .cond-row .rm {
+      flex: 0 0 auto; padding: 6px 10px; font-size: 12px;
+      background: #2a1a20; border: 1px solid #5e3340; border-radius: 8px;
+    }
+    /* 相近词弱提示弹窗 */
+    .mask {
+      position: fixed; inset: 0; background: rgba(4, 8, 18, .72);
+      display: flex; align-items: center; justify-content: center; z-index: 50;
+    }
+    .mask[hidden] { display: none; }
+    .modal {
+      width: min(560px, 92vw); background: #101a30;
+      border: 1px solid #3a5390; border-radius: 14px; padding: 22px 24px;
+      box-shadow: 0 18px 60px rgba(0, 0, 0, .55);
+    }
+    .modal h3 { font-size: 15px; color: #ffd28a; margin-bottom: 10px; }
+    .modal p { font-size: 13px; color: #cdd9f2; margin-bottom: 12px; line-height: 1.6; }
+    .modal ul { list-style: none; margin-bottom: 16px; }
+    .modal li {
+      font-size: 12px; color: #9aa7c4; padding: 8px 10px;
+      background: #0d1425; border: 1px solid #22304f; border-radius: 8px;
+      margin-bottom: 6px; line-height: 1.55;
+    }
+    .modal li b { color: #e8eefc; font-size: 13px; }
+    .modal li .score { color: #ffd28a; }
+    /* 待收纳池 · 人机共审列表（Task 6.2.2） */
+    .pend-row {
+      display: flex; gap: 12px; align-items: flex-start;
+      background: #0d1425; border: 1px solid #22304f; border-radius: 10px;
+      padding: 12px 14px; margin-bottom: 10px;
+    }
+    .pend-row input[type="checkbox"] { margin-top: 5px; accent-color: #6f9bff; }
+    .pend-main { flex: 1; min-width: 0; }
+    .pend-title { font-size: 13px; color: #e8eefc; margin-bottom: 4px; }
+    .pend-title .arrow { color: #6f9bff; margin: 0 4px; }
+    .pend-title .tag {
+      display: inline-block; margin-left: 8px; padding: 1px 8px;
+      font-size: 11px; color: #ffd28a; background: #2a2130;
+      border: 1px solid #5e4a33; border-radius: 999px;
+    }
+    .pend-ev { font-size: 11px; color: #8fa3c8; margin-bottom: 8px; word-break: break-all; }
+    .pend-ops { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .pend-ops input[type="range"] { width: 140px; }
+    .pend-ops .wv { font-size: 12px; color: #9fc0ff; min-width: 36px; }
+    .pend-ops input[type="text"].pRel {
+      width: 120px; padding: 5px 8px; font-size: 12px;
+      background: #0a1120; border-radius: 6px;
+    }
+    .pend-ops button { padding: 5px 12px; font-size: 12px; }
+    .pend-ops button.danger { background: #3a1a24; border: 1px solid #7a3347; }
+    .selbar { font-size: 12px; color: #8fa3c8; margin-left: auto; }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">Synapse<span class="accent">Mind</span> · 控制台</div>
+    <nav>
+      <a href="/settings">设置</a>
+      <form action="/logout" method="post"><button class="ghost" type="submit">退出</button></form>
+    </nav>
+  </header>
+
+  <!-- 上半区 ①：建立概念节点 -->
+  <div class="card">
+    <h2>① 建立概念节点</h2>
+    <div class="row">
+      <div><label>概念名 *</label><input type="text" id="cName" placeholder="如：恶寒" maxlength="64"></div>
+      <div><label>分类标签 *</label><input type="text" id="cCat" placeholder="如：症状 / 证型 / 方剂" maxlength="32"></div>
+      <div><label>释义（可选）</label><input type="text" id="cDesc" placeholder="概念简要说明" maxlength="500"></div>
+    </div>
+    <div class="actions">
+      <button id="btnConcept">创建概念</button><span class="msg" id="msgC"></span>
+    </div>
+  </div>
+
+  <!-- 上半区 ②：突触连线（录入即确认） -->
+  <div class="card">
+    <h2>② 突触连线（手工录入即确认，直接进入已学知识）</h2>
+    <div class="row">
+      <div><label>起点概念 *</label><input type="text" list="dlConcepts" id="sSrc" placeholder="输入或选择概念名"></div>
+      <div><label>终点概念 *</label><input type="text" list="dlConcepts" id="sDst" placeholder="输入或选择概念名"></div>
+      <div><label>关系标签 *</label><input type="text" id="sRel" placeholder="causes / inhibits / relates" maxlength="64"></div>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <div>
+        <label>传导权重 <b id="wVal" style="color:#9fc0ff">0.50</b>（能量扩散系数 ∈ [0,1]）</label>
+        <input type="range" id="sW" min="0" max="1" step="0.05" value="0.5">
+      </div>
+      <div><label>证据 / 出处（可选，推演回溯用）</label><input type="text" id="sEv" maxlength="1000"></div>
+    </div>
+    <datalist id="dlConcepts"></datalist>
+    <div class="actions">
+      <button id="btnSyn">创建连线</button><span class="msg" id="msgS"></span>
+    </div>
+  </div>
+
+  <!-- 上半区 ③：规则断言（A + B 导致 C） -->
+  <div class="card">
+    <h2>③ 规则断言（多前提组合 → 单一结论，物化为前提→结论突触）</h2>
+    <label>前提条件（1~8 个，按概念名）</label>
+    <div id="condRows"></div>
+    <button class="ghost" id="btnAddCond" type="button">+ 添加前提</button>
+    <div class="row" style="margin-top:12px">
+      <div><label>结论概念 *</label><input type="text" list="dlConcepts" id="rConc" placeholder="如：太阳伤寒证"></div>
+      <div><label>断言出处（可选，经典条文/医案）</label><input type="text" id="rEv" maxlength="1000"></div>
+    </div>
+    <div class="actions">
+      <button id="btnRule">录入断言</button><span class="msg" id="msgR"></span>
+    </div>
+  </div>
+
+  <!-- 下半区：待收纳池与人机共审（Task 6.2.2） -->
+  <div class="card" id="pendingArea">
+    <h2>待收纳池（AI 提案 · 人工处置）</h2>
+    <div class="actions" style="margin:0 0 12px">
+      <button class="ghost" id="btnPendReload" type="button">刷新列表</button>
+      <button id="btnPendConfirm" type="button" disabled>✓ 批量确认选中</button>
+      <button class="ghost" id="btnPendReject" type="button" disabled>✗ 批量拒绝选中</button>
+      <span class="selbar" id="pendSelInfo"></span>
+      <span class="msg" id="msgP"></span>
+    </div>
+    <div id="pendList"></div>
+    <div class="empty" id="pendEmpty">当前没有待收纳提案（辅助模式的 AI 提案将出现在这里，由人工确认后方可参与推演）。</div>
+  </div>
+
+  <!-- 神经图谱视口（Task 6.3.1 局部视口宿主 + Task 6.3.2 脉冲动画画布） -->
+  <div class="card" id="graphArea">
+    <h2>④ 神经图谱视口（局部视口 · 仅渲染已确认知识）</h2>
+    <div id="graphCanvas"></div>
+  </div>
+
+  <!-- 纯图推演看板（Task 6.3.2：脉冲动画 + 真实证据链打印） -->
+  <div class="card">
+    <h2>⑤ 纯图推演（能量扩散 · 结论与证据链 100% 可回溯）</h2>
+    <div class="row">
+      <div><label>推演线索 *</label><input type="text" id="dClue" list="dlConcepts" placeholder="如：恶寒 发热" maxlength="256"></div>
+    </div>
+    <div class="actions">
+      <button id="btnReason">开始推演</button>
+      <button class="ghost" id="btnPulseReplay" type="button" hidden>↻ 重播脉冲</button>
+      <span class="msg" id="msgD"></span>
+    </div>
+    <div id="reasonOut"></div>
+  </div>
+</div>
+
+<!-- 相近词弱提示弹窗（红线：仅提示，绝不自动合并/改名） -->
+<div class="mask" id="simMask" hidden>
+  <div class="modal">
+    <h3>⚠ 发现相近概念</h3>
+    <p id="simHint"></p>
+    <ul id="simList"></ul>
+    <div class="actions">
+      <button id="simForce">确认为不同概念，仍要新建</button>
+      <button class="ghost" id="simLink">取消建点，改用相近概念连线</button>
+      <button class="ghost" id="simCancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+
+function setMsg(id, text, ok) {
+  const el = $(id);
+  el.textContent = text;
+  el.className = "msg " + (ok ? "ok" : "err");
+}
+
+async function api(path, opts = {}) {
+  const init = { method: opts.method || "GET", headers: {} };
+  if (opts.body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(opts.body);
+  }
+  const resp = await fetch(path, init);
+  let data = {};
+  try { data = await resp.json(); } catch (_) { /* 非 JSON（如 302 登录页） */ }
+  if (!resp.ok) {
+    const d = data.detail;
+    const text = Array.isArray(d)
+      ? d.map((e) => `${(e.loc || []).slice(1).join(".")}: ${e.msg}`).join("；")
+      : (d || `HTTP ${resp.status}`);
+    throw new Error(text);
+  }
+  return data;
+}
+
+// ── 概念缓存与选择器 ──
+let CONCEPTS = [];
+
+async function loadConcepts() {
+  const d = await api("/api/concepts");
+  CONCEPTS = d.items || [];
+  $("dlConcepts").innerHTML = CONCEPTS.map(
+    (c) => `<option value="${esc(c.name)}">${esc(c.id)} · ${esc(c.category)}</option>`
+  ).join("");
+}
+
+const idByName = (name) => {
+  const hit = CONCEPTS.find((c) => c.name === name);
+  return hit ? hit.id : null;
+};
+
+// ── ① 建点（含相近词弱提示流程）──
+let pendingConcept = null;   // 弹窗期间暂存的表单值
+
+async function submitConcept(force) {
+  const body = {
+    name: $("cName").value, category: $("cCat").value, description: $("cDesc").value,
+  };
+  if (force) body.force = true;
+  const resp = await api("/api/concepts", { method: "POST", body });
+  if (resp.created) {
+    setMsg("msgC", `✓ 概念已创建（id=${resp.id}）`, true);
+    $("cName").value = ""; $("cDesc").value = "";
+    await loadConcepts();
+    return true;
+  }
+  // 命中弱提示：弹窗交人工裁决
+  pendingConcept = body;
+  const sim = resp.similarity;
+  $("simHint").textContent = sim.hint || "发现相近的既有概念，请人工裁决：";
+  $("simList").innerHTML = (sim.candidates || []).map((c) =>
+    `<li><b>${esc(c.name)}</b>（${esc(c.category)}）<span class="score">相似度 ${c.score}%</span>` +
+    (c.description ? `<br>${esc(c.description)}` : "") + `</li>`
+  ).join("");
+  $("simMask").hidden = false;
+  return false;
+}
+
+$("btnConcept").addEventListener("click", async (ev) => {
+  ev.target.disabled = true; setMsg("msgC", "提交中…", true);
+  try { await submitConcept(false); }
+  catch (e) { setMsg("msgC", "✗ " + e.message, false); }
+  finally { ev.target.disabled = false; }
+});
+
+$("simForce").addEventListener("click", async () => {
+  $("simMask").hidden = true;
+  try {
+    const ok = await submitConcept(true);
+    if (ok) setMsg("msgC", "✓ 已确认为不同概念并创建", true);
+  } catch (e) { setMsg("msgC", "✗ " + e.message, false); }
+});
+
+$("simLink").addEventListener("click", () => {
+  // 放弃建点：把相近既有概念填入连线起点，新名填入终点，引导人工建立关联
+  const first = document.querySelector("#simList li b");
+  if (first) $("sSrc").value = first.textContent;
+  $("sDst").value = pendingConcept ? pendingConcept.name : "";
+  $("cName").value = "";
+  $("simMask").hidden = true;
+  setMsg("msgC", "已取消建点，可在下方 ② 中为两个概念建立连线", true);
+  $("sDst").focus();
+});
+
+$("simCancel").addEventListener("click", () => { $("simMask").hidden = true; });
+
+// ── ② 连线 ──
+$("sW").addEventListener("input", () => { $("wVal").textContent = Number($("sW").value).toFixed(2); });
+
+$("btnSyn").addEventListener("click", async (ev) => {
+  ev.target.disabled = true; setMsg("msgS", "提交中…", true);
+  try {
+    const srcName = $("sSrc").value.trim(), dstName = $("sDst").value.trim();
+    const srcId = idByName(srcName), dstId = idByName(dstName);
+    if (!srcId) throw new Error(`起点概念不存在：${srcName}，请先在 ① 中建点`);
+    if (!dstId) throw new Error(`终点概念不存在：${dstName}，请先在 ① 中建点`);
+    const resp = await api("/api/synapses", {
+      method: "POST",
+      body: {
+        src_id: srcId, dst_id: dstId,
+        relation: $("sRel").value, weight: Number($("sW").value),
+        evidence: $("sEv").value,
+      },
+    });
+    setMsg("msgS", `✓ 连线已确认入库（rel_id=${resp.rel_id}）`, true);
+    $("sRel").value = ""; $("sEv").value = "";
+  } catch (e) { setMsg("msgS", "✗ " + e.message, false); }
+  finally { ev.target.disabled = false; }
+});
+
+// ── ③ 规则断言：动态前提行 ──
+function addCondRow(value = "") {
+  const rows = document.querySelectorAll(".cond-row");
+  if (rows.length >= 8) { setMsg("msgR", "✗ 前提条件最多 8 个", false); return; }
+  const div = document.createElement("div");
+  div.className = "cond-row";
+  div.innerHTML =
+    `<input type="text" list="dlConcepts" class="condInput" placeholder="前提概念名" maxlength="64" value="${esc(value)}">` +
+    `<button class="rm" type="button">移除</button>`;
+  div.querySelector(".rm").addEventListener("click", () => {
+    if (document.querySelectorAll(".cond-row").length <= 1) { setMsg("msgR", "至少保留 1 个前提", false); return; }
+    div.remove();
+  });
+  $("condRows").appendChild(div);
+}
+addCondRow(); addCondRow();
+$("btnAddCond").addEventListener("click", () => addCondRow());
+
+$("btnRule").addEventListener("click", async (ev) => {
+  ev.target.disabled = true; setMsg("msgR", "提交中…", true);
+  try {
+    const conditions = [...document.querySelectorAll(".condInput")]
+      .map((i) => i.value.trim()).filter(Boolean);
+    const resp = await api("/api/rules", {
+      method: "POST",
+      body: { conditions, conclusion: $("rConc").value, evidence: $("rEv").value },
+    });
+    setMsg("msgR", `✓ 断言已物化为 ${resp.fanin} 条已确认突触`, true);
+    $("rConc").value = ""; $("rEv").value = "";
+    document.querySelectorAll(".condInput").forEach((i) => { i.value = ""; });
+  } catch (e) { setMsg("msgR", "✗ " + e.message, false); }
+  finally { ev.target.disabled = false; }
+});
+
+// ── ④ 待收纳池（Task 6.2.2：PENDING 提案人工处置）──
+// 铁律对齐：确认（→CONFIRMED）/ 拒绝（→REJECTED）/ 编辑 / 删除全部走后端
+// 状态机闸口；前端绝不伪造状态。确认动作会改变 CONFIRMED 子图，
+// 通过 refreshGraphView 钩子 + synapses:changed 事件即时通知图视图刷新。
+let PENDING = [];
+
+function notifyGraphRefresh() {
+  // 图视图（Task 6.3.1 graph_view.js）就绪后暴露 window.refreshGraphView 即自动联动
+  if (typeof window.refreshGraphView === "function") {
+    try { window.refreshGraphView(); } catch (_) { /* 图视图异常不阻塞审核流 */ }
+  }
+  window.dispatchEvent(new CustomEvent("synapses:changed"));
+}
+
+async function loadPending() {
+  const d = await api("/api/synapses?status=PENDING");
+  PENDING = d.items || [];
+  renderPending();
+}
+
+function pendSelectedIds() {
+  return [...document.querySelectorAll("#pendList input[type=checkbox]:checked")]
+    .map((cb) => cb.value);
+}
+
+function syncPendBar() {
+  const n = pendSelectedIds().length;
+  $("btnPendConfirm").disabled = n === 0;
+  $("btnPendReject").disabled = n === 0;
+  $("pendSelInfo").textContent = n ? `已选 ${n} / ${PENDING.length} 条` : "";
+}
+
+function renderPending() {
+  const list = $("pendList");
+  $("pendEmpty").hidden = PENDING.length > 0;
+  list.innerHTML = PENDING.map((s) => `
+    <div class="pend-row" data-rid="${esc(s.rel_id)}">
+      <input type="checkbox" value="${esc(s.rel_id)}" title="选中参与批量处置">
+      <div class="pend-main">
+        <div class="pend-title">
+          ${esc(s.src_name)}（${esc(s.src_id)}）<span class="arrow">→</span>${esc(s.dst_name)}（${esc(s.dst_id)}）
+          <span class="tag">提案</span>
+        </div>
+        ${s.evidence ? `<div class="pend-ev">证据：${esc(s.evidence)}</div>` : ""}
+        <div class="pend-ops">
+          <label style="margin:0">权重</label>
+          <input type="range" class="pW" min="0" max="1" step="0.05" value="${Number(s.weight).toFixed(2)}">
+          <span class="wv">${Number(s.weight).toFixed(2)}</span>
+          <input type="text" class="pRel" value="${esc(s.relation)}" maxlength="64" title="关系标签">
+          <button class="pSave" type="button" title="保存权重与关系修改">保存修改</button>
+          <button class="ghost pReject" type="button" title="否决该提案（保留审计痕迹）">拒绝</button>
+          <button class="ghost danger pDel" type="button" title="彻底删除该提案">删除</button>
+        </div>
+      </div>
+    </div>
+  `).join("");
+  syncPendBar();
+}
+
+// 滑块实时回显（事件委托，行可动态重建）
+$("pendList").addEventListener("input", (ev) => {
+  if (ev.target.classList.contains("pW")) {
+    ev.target.closest(".pend-ops").querySelector(".wv").textContent =
+      Number(ev.target.value).toFixed(2);
+  }
+});
+
+// 多选状态联动批量按钮
+$("pendList").addEventListener("change", (ev) => {
+  if (ev.target.type === "checkbox") syncPendBar();
+});
+
+// 行内操作：保存修改 / 单条拒绝 / 删除
+$("pendList").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button");
+  if (!btn) return;
+  const row = btn.closest(".pend-row");
+  const rid = row ? row.dataset.rid : null;
+  if (!rid) return;
+  btn.disabled = true;
+  try {
+    if (btn.classList.contains("pSave")) {
+      const ops = row.querySelector(".pend-ops");
+      const weight = Number(ops.querySelector(".pW").value);
+      const relation = ops.querySelector(".pRel").value.trim();
+      if (!relation) throw new Error("关系标签不得为空");
+      await api(`/api/synapses/${encodeURIComponent(rid)}`, {
+        method: "POST", body: { weight, relation },
+      });
+      const local = PENDING.find((s) => s.rel_id === rid);
+      if (local) { local.weight = weight; local.relation = relation; }
+      setMsg("msgP", "✓ 修改已保存", true);
+    } else if (btn.classList.contains("pReject")) {
+      await api("/api/synapses/batch", {
+        method: "POST", body: { rel_ids: [rid], action: "reject" },
+      });
+      setMsg("msgP", "✓ 提案已拒绝", true);
+      await loadPending();
+    } else if (btn.classList.contains("pDel")) {
+      await api(`/api/synapses/${encodeURIComponent(rid)}`, { method: "DELETE" });
+      setMsg("msgP", "✓ 提案已删除", true);
+      await loadPending();
+    }
+  } catch (e) {
+    setMsg("msgP", "✗ " + e.message, false);
+    btn.disabled = false;
+  }
+});
+
+// 批量处置：确认 / 拒绝
+async function pendBatch(action) {
+  const ids = pendSelectedIds();
+  if (!ids.length) return;
+  const label = action === "confirm" ? "确认" : "拒绝";
+  setMsg("msgP", `批量${label} ${ids.length} 条中…`, true);
+  $("btnPendConfirm").disabled = true;
+  $("btnPendReject").disabled = true;
+  try {
+    const r = await api("/api/synapses/batch", {
+      method: "POST", body: { rel_ids: ids, action },
+    });
+    const results = r.results || {};
+    const fails = ids.filter((rid) => results[rid] !== true);
+    if (fails.length) {
+      setMsg("msgP", `✗ ${fails.length} 条处置失败：${fails.map((rid) => `${rid}: ${results[rid]}`).join("；")}`, false);
+    } else {
+      setMsg("msgP", `✓ 已${label} ${ids.length} 条提案`, true);
+    }
+    await loadPending();
+    if (action === "confirm" && !fails.length) notifyGraphRefresh();
+  } catch (e) {
+    setMsg("msgP", "✗ " + e.message, false);
+    syncPendBar();
+  }
+}
+
+$("btnPendConfirm").addEventListener("click", () => pendBatch("confirm"));
+$("btnPendReject").addEventListener("click", () => pendBatch("reject"));
+$("btnPendReload").addEventListener("click", async () => {
+  try { await loadPending(); setMsg("msgP", "✓ 列表已刷新", true); }
+  catch (e) { setMsg("msgP", "✗ " + e.message, false); }
+});
+
+// ── ⑤ 纯图推演看板（Task 6.3.2：神经脉冲动画 + 真实证据链打印）──
+// 铁律对齐：结论与证据 100% 来自 /api/reason 返回的真实激活链，
+// 前端只负责可视化与打印，绝不自行推断、修饰或编造任何"证据"。
+let lastReason = null;   // 缓存最近一次推演结果（重播脉冲用）
+
+function renderReason(d) {
+  const out = $("reasonOut");
+  if (d.status !== "ok" || !d.answer) {
+    out.innerHTML = `<div class="empty">${esc(d.message || "推演无结论")}</div>`;
+    return;
+  }
+  const a = d.answer;
+  // id → 概念名 映射：以推演返回为准（图内概念可能超出页面 500 条缓存）
+  const names = new Map();
+  for (const act of d.activations || []) if (act.name) names.set(act.id, act.name);
+  if (a.conclusion && a.conclusion.name) names.set(a.conclusion.id, a.conclusion.name);
+  for (const c of (a.assertion && a.assertion.conditions) || []) if (c.name) names.set(c.id, c.name);
+  const nm = (id) => esc(names.get(id) || String(id).slice(0, 12));
+
+  const condHtml = a.assertion
+    ? `<div style="margin:8px 0 2px;font-size:12.5px;color:#9fb3d9">规则断言命中（多前提汇流 fanin=${a.assertion.conditions.length}）：<b style="color:#ffd28a">${a.assertion.conditions.map((c) => esc(c.name)).join(" ＋ ")}</b> ⇒ <b style="color:#7fe3a0">${esc(a.conclusion.name)}</b></div>`
+    : `<div style="margin:8px 0 2px;font-size:12.5px;color:#9fb3d9">无多前提断言命中，结论取自峰值最高的传导激活节点（单链推演）。</div>`;
+
+  // 结论路径证据链：逐跳打印真实 evidence 原文（缺失时如实标注，不补造）
+  const chainRows = (a.chain || []).map((s, i) => `
+    <div style="display:flex;gap:10px;flex-wrap:wrap;padding:7px 10px;border-left:3px solid #ffd28a;background:#101a30;border-radius:6px;margin:6px 0;font-size:12.5px">
+      <span style="color:#5d6f94;white-space:nowrap">第 ${i + 1} 跳</span>
+      <span style="white-space:nowrap">${nm(s.src_id)} <span style="color:#ffd28a">—[${esc(s.relation || "relates")}]→</span> ${nm(s.dst_id)}</span>
+      <span style="color:#9fb3d9;flex:1;min-width:200px">证据：${s.evidence ? esc(s.evidence) : "（该突触未录入证据文本）"}</span>
+    </div>`).join("");
+
+  const assertionEvi = (a.assertion && a.assertion.evidence && a.assertion.evidence.length)
+    ? `<div style="margin-top:8px;font-size:12.5px;color:#9fb3d9">断言出处（各前提→结论突触 evidence 原文）：</div>` +
+      a.assertion.evidence.map((e) =>
+        `<div style="padding:5px 10px;border-left:3px solid #7fe3a0;background:#0f1d2e;border-radius:6px;margin:5px 0;font-size:12.5px">${esc(e)}</div>`
+      ).join("")
+    : "";
+
+  const actRows = (d.activations || []).map((act, i) => `
+    <tr>
+      <td style="padding:5px 8px;color:#5d6f94">${i + 1}</td>
+      <td style="padding:5px 8px">${esc(act.name || act.id)}</td>
+      <td style="padding:5px 8px;color:#ffd28a">${act.hop ?? "-"}</td>
+      <td style="padding:5px 8px;color:#7fe3a0">${Number(act.peak || 0).toFixed(3)}</td>
+    </tr>`).join("");
+
+  out.innerHTML = `
+    <div style="border:1px solid #23324f;border-radius:10px;padding:12px 14px;background:#0c1425">
+      <div style="font-size:13px;color:#9fb3d9">推演结论</div>
+      <div style="font-size:18px;font-weight:700;margin:4px 0">${esc(a.conclusion.name || a.conclusion.id)}
+        <span style="font-size:12px;color:#5d6f94;font-weight:400">${esc(a.conclusion.category || "")} · 峰值 ${Number(a.peak || 0).toFixed(3)} · 第 ${a.hop ?? "-"} 跳激活</span>
+      </div>
+      ${condHtml}
+      <div style="margin-top:10px;font-size:13px;color:#dbe4f7">真实证据链（结论路径逐跳可回溯）</div>
+      ${chainRows || '<div class="empty">结论即线索命中概念，无传导边。</div>'}
+      ${assertionEvi}
+      <details style="margin-top:10px">
+        <summary style="cursor:pointer;font-size:12.5px;color:#9fb3d9">激活序列（按峰值能量降序，共 ${(d.activations || []).length} 节点）</summary>
+        <table style="width:100%;border-collapse:collapse;font-size:12.5px;margin-top:6px">
+          <thead><tr style="color:#5d6f94;text-align:left"><th style="padding:5px 8px">#</th><th style="padding:5px 8px">概念</th><th style="padding:5px 8px">跳</th><th style="padding:5px 8px">峰值能量</th></tr></thead>
+          <tbody>${actRows}</tbody>
+        </table>
+      </details>
+    </div>`;
+}
+
+async function runReason() {
+  const clue = $("dClue").value.trim();
+  if (!clue) { setMsg("msgD", "请输入推演线索", false); return; }
+  $("btnReason").disabled = true;
+  setMsg("msgD", "推演中…（阻尼能量扩散）", true);
+  try {
+    const d = await api("/api/reason", { method: "POST", body: { clue } });
+    lastReason = d;
+    renderReason(d);
+    const hasPulse = !!(window.SynapseGraph && typeof window.SynapseGraph.playPulse === "function");
+    $("btnPulseReplay").hidden = !(hasPulse && d.activations && d.activations.length);
+    if (hasPulse) {
+      // 先在图视口渲染激活子图（绿描边），再按扩散时序播放神经脉冲
+      await window.SynapseGraph.renderActivation({
+        node_ids: (d.activations || []).map((x) => x.id),
+        title: `「${clue}」推演激活`,
+      });
+      await window.SynapseGraph.playPulse(d.activations);
+      setMsg("msgD", "✓ 推演完成（脉冲已按扩散时序播放）", true);
+    } else {
+      setMsg("msgD", "✓ 推演完成（图视图未就绪，仅打印证据链）", true);
+    }
+  } catch (e) {
+    setMsg("msgD", "✗ " + e.message, false);
+  } finally {
+    $("btnReason").disabled = false;
+  }
+}
+
+$("btnReason").addEventListener("click", runReason);
+$("dClue").addEventListener("keydown", (ev) => { if (ev.key === "Enter") runReason(); });
+$("btnPulseReplay").addEventListener("click", async () => {
+  if (!lastReason || !window.SynapseGraph || typeof window.SynapseGraph.playPulse !== "function") return;
+  $("btnPulseReplay").disabled = true;
+  try { await window.SynapseGraph.playPulse(lastReason.activations); }
+  catch (e) { setMsg("msgD", "✗ 脉冲重播失败：" + e.message, false); }
+  finally { $("btnPulseReplay").disabled = false; }
+});
+
+(async function boot() {
+  try { await loadConcepts(); }
+  catch (e) { console.error("概念列表加载失败", e); }
+  loadPending().catch((e) => setMsg("msgP", "✗ 待收纳列表加载失败：" + e.message, false));
+})();
+</script>
+</body>
+</html>
