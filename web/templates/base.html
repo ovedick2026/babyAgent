@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}控制台{% endblock %} - SynapseMind</title>
+  <link rel="stylesheet" href="/static/css/app.css">
+  {% block head %}{% endblock %}
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">Synapse<span class="accent">Mind</span> · 控制台</div>
+    <nav class="main-nav">
+      <a href="/" class="{{ 'active' if active_nav == 'graph' else '' }}">图谱推演</a>
+      <a href="/workshop" class="{{ 'active' if active_nav == 'workshop' else '' }}">知识工坊</a>
+      <a href="/manual" class="{{ 'active' if active_nav == 'manual' else '' }}">手工编辑</a>
+      <a href="/settings" class="{{ 'active' if active_nav == 'settings' else '' }}">设置</a>
+      <form method="post" action="/logout"><button class="ghost" type="submit">登出</button></form>
+    </nav>
+  </header>
+
+  {% block content %}{% endblock %}
+</div>
+
+<!-- 手机底部标签栏（≤640px 显示，桌面隐藏）：与顶导航同构五入口 -->
+<nav class="tabbar">
+  <a href="/" class="{{ 'active' if active_nav == 'graph' else '' }}"><span class="ico">🕸</span>图谱</a>
+  <a href="/workshop" class="{{ 'active' if active_nav == 'workshop' else '' }}"><span class="ico">📚</span>工坊</a>
+  <a href="/manual" class="{{ 'active' if active_nav == 'manual' else '' }}"><span class="ico">✏️</span>编辑</a>
+  <a href="/settings" class="{{ 'active' if active_nav == 'settings' else '' }}"><span class="ico">⚙️</span>设置</a>
+  <form method="post" action="/logout" style="flex:1;display:flex"><button class="ghost" type="submit" style="flex:1;padding:4px 0;font-size:11px">登出</button></form>
+</nav>
+
+{% block scripts %}{% endblock %}
+</body>
+</html>

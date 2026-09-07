@@ -1,0 +1,378 @@
+{% extends "base.html" %}
+
+{% block title %}知识工坊{% endblock %}
+
+{% block head %}
+<style>
+  /* 页面专属：状态徽章 / 文档行 / 进度条（Task 11.7，通用底座在 app.css） */
+  .badge { display:inline-block; padding:1px 8px; font-size:11px; border-radius:999px; border:1px solid; }
+  .badge.QUEUED  { color:#9fc0ff; border-color:#33477a; background:#131f3a; }
+  .badge.RUNNING { color:#ffd28a; border-color:#5e4a33; background:#2a2130; }
+  .badge.PAUSED  { color:#c9b3ff; border-color:#4a3a6e; background:#221a33; }
+  .badge.DONE    { color:#7fe3a0; border-color:#2f5e40; background:#12241a; }
+  .badge.FAILED  { color:#ff9b9b; border-color:#7a3347; background:#2a1218; }
+  .doc-row {
+    display:flex; gap:12px; align-items:flex-start;
+    background:#0d1425; border:1px solid #22304f; border-radius:10px;
+    padding:12px 14px; margin-bottom:10px;
+  }
+  .doc-main { flex:1; min-width:0; }
+  .doc-title { font-size:13px; color:#e8eefc; margin-bottom:6px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .doc-err { font-size:11.5px; color:#ff9b9b; margin:6px 0; word-break:break-all; }
+  .prog { display:flex; align-items:center; gap:10px; margin:4px 0 8px; }
+  .prog-bar { flex:1; height:6px; background:#0a1120; border:1px solid #22304f; border-radius:999px; overflow:hidden; }
+  .prog-bar > i { display:block; height:100%; background:linear-gradient(90deg,#3b6cf0,#6f9bff); transition:width .4s; }
+  .prog-txt { font-size:11.5px; color:#8fa3c8; white-space:nowrap; }
+  .doc-ops { display:flex; gap:8px; flex-wrap:wrap; }
+  .doc-ops button { padding:5px 12px; font-size:12px; }
+  .doc-ops button.danger { background:#3a1a24; border:1px solid #7a3347; }
+  textarea {
+    width:100%; min-height:150px; padding:9px 11px; font-size:13px; color:#eef2ff;
+    background:#0d1425; border:1px solid #2a3a5e; border-radius:8px; outline:none;
+    resize:vertical; font-family:inherit; line-height:1.6;
+  }
+  textarea:focus { border-color:#6f9bff; }
+  input[type="file"] { font-size:12px; color:#8fa3c8; }
+  @media (max-width:640px) {
+    .doc-row { flex-direction:column; }
+    .doc-ops { width:100%; }
+    .doc-ops button { flex:1; }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<!-- ① 投喂：粘贴正文或选择 txt（FileReader 读入，免 multipart） -->
+<div class="card">
+  <h2>① 投喂知识文本 / txt</h2>
+  <div class="row">
+    <div><label>标题 *</label><input type="text" id="dTitle" placeholder="如：伤寒论选段" maxlength="128"></div>
+    <div style="flex:0 1 auto"><label>选择 .txt 文件（自动读入正文）</label><input type="file" id="dFile" accept=".txt,text/plain"></div>
+  </div>
+  <div style="margin-top:12px">
+    <label>正文 *（空行分段，引擎逐完整语义段提炼，防遗漏）</label>
+    <textarea id="dText" placeholder="粘贴完整资料文本…"></textarea>
+  </div>
+  <div class="actions">
+    <button id="btnFeed">加入待提炼列表</button><span class="msg" id="msgF"></span>
+  </div>
+</div>
+
+<!-- ② 待提炼列表：1.5s 轮询；按钮状态机 提炼/暂停(→继续)/取消(→提炼)/删除 -->
+<div class="card">
+  <h2>② 待提炼列表</h2>
+  <div class="actions" style="margin:0 0 12px">
+    <button class="ghost" id="btnDocsReload" type="button">刷新</button>
+    <span class="msg" id="msgD"></span>
+  </div>
+  <div id="docList"></div>
+  <div class="empty" id="docEmpty">列表为空。投喂文本后点「提炼」，引擎将逐段生成突触提案（全部入待收纳池，人工确认后方可参与推演）。</div>
+</div>
+
+<!-- ③ 待收纳池（自 index.html 迁移，Task 6.2.2 人机共审） -->
+<div class="card" id="pendingArea">
+  <h2>③ 待收纳池（AI 提案 · 人工处置）</h2>
+  <div class="actions" style="margin:0 0 12px">
+    <button class="ghost" id="btnPendReload" type="button">刷新列表</button>
+    <button id="btnPendConfirm" type="button" disabled>✓ 批量确认选中</button>
+    <button class="ghost" id="btnPendReject" type="button" disabled>✗ 批量拒绝选中</button>
+    <span class="selbar" id="pendSelInfo"></span>
+    <span class="msg" id="msgP"></span>
+  </div>
+  <div id="pendList"></div>
+  <div class="empty" id="pendEmpty">当前没有待收纳提案（上方提炼产出的突触提案将出现在这里，由人工确认后方可参与推演）。</div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+
+function setMsg(id, text, ok) {
+  const el = $(id);
+  el.textContent = text;
+  el.className = "msg " + (ok ? "ok" : "err");
+}
+
+async function api(path, opts = {}) {
+  const init = { method: opts.method || "GET", headers: {} };
+  if (opts.body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(opts.body);
+  }
+  const resp = await fetch(path, init);
+  let data = {};
+  try { data = await resp.json(); } catch (_) { /* 非 JSON（如 302 登录页） */ }
+  if (!resp.ok) {
+    const d = data.detail;
+    const text = Array.isArray(d)
+      ? d.map((e) => `${(e.loc || []).slice(1).join(".")}: ${e.msg}`).join("；")
+      : (d || `HTTP ${resp.status}`);
+    throw new Error(text);
+  }
+  return data;
+}
+
+// ── ② 待提炼列表（Task 11.7：1.5s 轮询 + 内容签名比对，无变化不重绘防闪烁）──
+let DOCS = [], BUSY = null, _docSig = null;
+
+async function loadDocs() {
+  const d = await api("/api/docs");
+  const items = d.items || [], busy = d.busy || null;
+  const sig = JSON.stringify([items, busy]);
+  if (sig !== _docSig) {
+    _docSig = sig;
+    DOCS = items;
+    BUSY = busy;
+    renderDocs();
+  }
+}
+
+// 四按钮状态机：提炼 / 暂停(→继续) / 取消(→提炼) / 删除；引擎全局单任务互斥时禁用他行 start
+function docOps(d) {
+  const busyElsewhere = BUSY && BUSY.doc_id !== d.id;
+  const startDis = busyElsewhere ? ' disabled title="引擎正在提炼其他文档（单任务互斥）"' : "";
+  const delDis = d.status === "RUNNING" ? ' disabled title="提炼运行中禁止删除，请先暂停或取消"' : "";
+  const b = [];
+  if (d.status === "QUEUED") b.push(`<button data-act="start"${startDis}>▶ 提炼</button>`);
+  if (d.status === "RUNNING") b.push(`<button data-act="pause">⏸ 暂停</button>`);
+  if (d.status === "PAUSED") b.push(`<button data-act="start"${startDis}>▶ 继续</button>`);
+  if (d.status === "FAILED") b.push(`<button data-act="start"${startDis}>▶ 重试</button>`);
+  if (d.status === "RUNNING" || d.status === "PAUSED" || d.status === "FAILED")
+    b.push(`<button class="ghost" data-act="cancel">✗ 取消</button>`);
+  if (d.status === "DONE") b.push(`<span class="badge DONE">✓ 已完成</span>`);
+  b.push(`<button class="ghost danger" data-act="delete"${delDis}>🗑 删除</button>`);
+  return b.join("");
+}
+
+function renderDocs() {
+  const list = $("docList");
+  $("docEmpty").hidden = DOCS.length > 0;
+  list.innerHTML = DOCS.map((d) => {
+    const pct = Number(d.progress) || 0;
+    const isBusy = BUSY && BUSY.doc_id === d.id;
+    return `
+    <div class="doc-row" data-id="${d.id}">
+      <div class="doc-main">
+        <div class="doc-title">#${d.id} ${esc(d.title)} <span class="badge ${esc(d.status)}">${esc(d.status)}</span></div>
+        <div class="prog">
+          <div class="prog-bar"><i style="width:${pct}%"></i></div>
+          <span class="prog-txt">${d.done}/${d.total} 段 · ${pct}%${d.proposals ? ` · 提案 ${d.proposals} 条` : ""}</span>
+        </div>
+        ${d.error ? `<div class="doc-err">✗ ${esc(d.error)}</div>` : ""}
+        ${isBusy ? `<div class="prog-txt" style="color:#ffd28a">⚙ 引擎正在处理该文档…</div>` : ""}
+      </div>
+      <div class="doc-ops">${docOps(d)}</div>
+    </div>`;
+  }).join("");
+}
+
+// 行内操作（事件委托）：start / pause / cancel / delete
+$("docList").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button[data-act]");
+  if (!btn) return;
+  const id = btn.closest(".doc-row").dataset.id;
+  const act = btn.dataset.act;
+  if (act === "delete" && !confirm(`确定删除文档 #${id}（整行含原文与进度）？`)) return;
+  if (act === "cancel" && !confirm("取消将清空该文档的提炼进度并变回待提炼状态，确定？")) return;
+  btn.disabled = true;
+  try {
+    await api(act === "delete" ? `/api/docs/${id}` : `/api/docs/${id}/${act}`,
+              { method: act === "delete" ? "DELETE" : "POST" });
+    _docSig = null;                 // 强制下次轮询立即重绘
+    await loadDocs();
+  } catch (e) {
+    setMsg("msgD", "✗ " + e.message, false);
+    btn.disabled = false;
+  }
+});
+
+$("btnDocsReload").addEventListener("click", async () => {
+  try { _docSig = null; await loadDocs(); setMsg("msgD", "✓ 列表已刷新", true); }
+  catch (e) { setMsg("msgD", "✗ " + e.message, false); }
+});
+
+// ── ① 投喂：txt 经 FileReader 读入（免 multipart，手机端同样可用）──
+$("dFile").addEventListener("change", () => {
+  const f = $("dFile").files[0];
+  if (!f) return;
+  const rd = new FileReader();
+  rd.onload = () => {
+    const text = String(rd.result || "").trim();
+    if (!text) { setMsg("msgF", "✗ 文件内容为空", false); $("dFile").value = ""; return; }
+    if (text.length > 200000) {
+      setMsg("msgF", `✗ 文件过长（${text.length} 字 > 200000 上限），请拆分后分次投喂`, false);
+      $("dFile").value = "";
+      return;
+    }
+    $("dText").value = text;
+    if (!$("dTitle").value.trim()) $("dTitle").value = f.name.replace(/\.txt$/i, "");
+    setMsg("msgF", `✓ 已读入 ${esc(f.name)}（${text.length} 字），核对后点「加入待提炼列表」`, true);
+  };
+  rd.onerror = () => setMsg("msgF", "✗ 文件读取失败", false);
+  rd.readAsText(f, "utf-8");
+});
+
+$("btnFeed").addEventListener("click", async (ev) => {
+  ev.target.disabled = true; setMsg("msgF", "提交中…", true);
+  try {
+    const r = await api("/api/docs", {
+      method: "POST",
+      body: { title: $("dTitle").value, text: $("dText").value },
+    });
+    setMsg("msgF", `✓ 已加入待提炼列表（doc=${r.doc.id}），点「提炼」开始`, true);
+    $("dText").value = ""; $("dFile").value = "";
+    _docSig = null;
+    await loadDocs();
+  } catch (e) { setMsg("msgF", "✗ " + e.message, false); }
+  finally { ev.target.disabled = false; }
+});
+
+// ── ③ 待收纳池（自 index.html 原样迁移，Task 6.2.2 语义不变）──
+// 铁律对齐：确认（→CONFIRMED）/ 拒绝（→REJECTED）/ 编辑 / 删除全部走后端
+// 状态机闸口；前端绝不伪造状态。
+let PENDING = [];
+
+function notifyGraphRefresh() {
+  // 图视图就绪后暴露 window.refreshGraphView 即自动联动；工坊页无图视图时安全跳过
+  if (typeof window.refreshGraphView === "function") {
+    try { window.refreshGraphView(); } catch (_) { /* 图视图异常不阻塞审核流 */ }
+  }
+  window.dispatchEvent(new CustomEvent("synapses:changed"));
+}
+
+async function loadPending() {
+  const d = await api("/api/synapses?status=PENDING");
+  PENDING = d.items || [];
+  renderPending();
+}
+
+function pendSelectedIds() {
+  return [...document.querySelectorAll("#pendList input[type=checkbox]:checked")]
+    .map((cb) => cb.value);
+}
+
+function syncPendBar() {
+  const n = pendSelectedIds().length;
+  $("btnPendConfirm").disabled = n === 0;
+  $("btnPendReject").disabled = n === 0;
+  $("pendSelInfo").textContent = n ? `已选 ${n} / ${PENDING.length} 条` : "";
+}
+
+function renderPending() {
+  const list = $("pendList");
+  $("pendEmpty").hidden = PENDING.length > 0;
+  list.innerHTML = PENDING.map((s) => `
+    <div class="pend-row" data-rid="${esc(s.rel_id)}">
+      <input type="checkbox" value="${esc(s.rel_id)}" title="选中参与批量处置">
+      <div class="pend-main">
+        <div class="pend-title">
+          ${esc(s.src_name)}（${esc(s.src_id)}）<span class="arrow">→</span>${esc(s.dst_name)}（${esc(s.dst_id)}）
+          <span class="tag">提案</span>
+        </div>
+        ${s.evidence ? `<div class="pend-ev">证据：${esc(s.evidence)}</div>` : ""}
+        <div class="pend-ops">
+          <label style="margin:0">权重</label>
+          <input type="range" class="pW" min="0" max="1" step="0.05" value="${Number(s.weight).toFixed(2)}">
+          <span class="wv">${Number(s.weight).toFixed(2)}</span>
+          <input type="text" class="pRel" value="${esc(s.relation)}" maxlength="64" title="关系标签">
+          <button class="pSave" type="button" title="保存权重与关系修改">保存修改</button>
+          <button class="ghost pReject" type="button" title="否决该提案（保留审计痕迹）">拒绝</button>
+          <button class="ghost danger pDel" type="button" title="彻底删除该提案">删除</button>
+        </div>
+      </div>
+    </div>
+  `).join("");
+  syncPendBar();
+}
+
+$("pendList").addEventListener("input", (ev) => {
+  if (ev.target.classList.contains("pW")) {
+    ev.target.closest(".pend-ops").querySelector(".wv").textContent =
+      Number(ev.target.value).toFixed(2);
+  }
+});
+
+$("pendList").addEventListener("change", (ev) => {
+  if (ev.target.type === "checkbox") syncPendBar();
+});
+
+$("pendList").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button");
+  if (!btn) return;
+  const row = btn.closest(".pend-row");
+  const rid = row ? row.dataset.rid : null;
+  if (!rid) return;
+  btn.disabled = true;
+  try {
+    if (btn.classList.contains("pSave")) {
+      const ops = row.querySelector(".pend-ops");
+      const weight = Number(ops.querySelector(".pW").value);
+      const relation = ops.querySelector(".pRel").value.trim();
+      if (!relation) throw new Error("关系标签不得为空");
+      await api(`/api/synapses/${encodeURIComponent(rid)}`, {
+        method: "POST", body: { weight, relation },
+      });
+      const local = PENDING.find((s) => s.rel_id === rid);
+      if (local) { local.weight = weight; local.relation = relation; }
+      setMsg("msgP", "✓ 修改已保存", true);
+    } else if (btn.classList.contains("pReject")) {
+      await api("/api/synapses/batch", {
+        method: "POST", body: { rel_ids: [rid], action: "reject" },
+      });
+      setMsg("msgP", "✓ 提案已拒绝", true);
+      await loadPending();
+    } else if (btn.classList.contains("pDel")) {
+      await api(`/api/synapses/${encodeURIComponent(rid)}`, { method: "DELETE" });
+      setMsg("msgP", "✓ 提案已删除", true);
+      await loadPending();
+    }
+  } catch (e) {
+    setMsg("msgP", "✗ " + e.message, false);
+    btn.disabled = false;
+  }
+});
+
+async function pendBatch(action) {
+  const ids = pendSelectedIds();
+  if (!ids.length) return;
+  const label = action === "confirm" ? "确认" : "拒绝";
+  setMsg("msgP", `批量${label} ${ids.length} 条中…`, true);
+  $("btnPendConfirm").disabled = true;
+  $("btnPendReject").disabled = true;
+  try {
+    const r = await api("/api/synapses/batch", {
+      method: "POST", body: { rel_ids: ids, action },
+    });
+    const results = r.results || {};
+    const fails = ids.filter((rid) => results[rid] !== true);
+    if (fails.length) {
+      setMsg("msgP", `✗ ${fails.length} 条处置失败：${fails.map((rid) => `${rid}: ${results[rid]}`).join("；")}`, false);
+    } else {
+      setMsg("msgP", `✓ 已${label} ${ids.length} 条提案`, true);
+    }
+    await loadPending();
+    if (action === "confirm" && !fails.length) notifyGraphRefresh();
+  } catch (e) {
+    setMsg("msgP", "✗ " + e.message, false);
+    syncPendBar();
+  }
+}
+
+$("btnPendConfirm").addEventListener("click", () => pendBatch("confirm"));
+$("btnPendReject").addEventListener("click", () => pendBatch("reject"));
+$("btnPendReload").addEventListener("click", async () => {
+  try { await loadPending(); setMsg("msgP", "✓ 列表已刷新", true); }
+  catch (e) { setMsg("msgP", "✗ " + e.message, false); }
+});
+
+(async function boot() {
+  try { await loadDocs(); }
+  catch (e) { setMsg("msgD", "✗ " + e.message, false); }
+  loadPending().catch((e) => setMsg("msgP", "✗ 待收纳列表加载失败：" + e.message, false));
+  setInterval(() => { loadDocs().catch(() => {}); }, 1500);
+})();
+</script>
+{% endblock %}

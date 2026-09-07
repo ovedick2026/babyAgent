@@ -1,101 +1,72 @@
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>设置 - SynapseMind</title>
-  <style>
-    :root { color-scheme: dark; }
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      min-height: 100vh;
-      background: radial-gradient(1200px 600px at 20% -10%, #1b2a4a 0%, #0b1120 55%, #070b14 100%);
-      font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
-      color: #e5eaf5;
-      padding: 28px 16px 60px;
-    }
-    .wrap { max-width: 880px; margin: 0 auto; }
-    header {
-      display: flex; align-items: center; justify-content: space-between;
-      margin-bottom: 26px;
-    }
-    .logo { font-size: 20px; font-weight: 700; letter-spacing: 1px; }
-    .logo .accent { color: #6f9bff; }
-    nav a {
-      margin-left: 14px; color: #8fa3c8; text-decoration: none; font-size: 13px;
-    }
-    nav a:hover { color: #cdd9f2; }
-    .card {
-      background: rgba(17, 24, 39, .85);
-      border: 1px solid rgba(99, 132, 255, .18);
-      border-radius: 12px;
-      padding: 22px 24px;
-      margin-bottom: 18px;
-    }
-    .card h2 {
-      font-size: 15px; font-weight: 600; color: #9fc0ff;
-      margin-bottom: 14px; letter-spacing: .5px;
-    }
-    .modes { display: flex; gap: 10px; flex-wrap: wrap; }
-    .mode {
-      flex: 1 1 200px; padding: 12px 14px;
-      background: #0d1425; border: 1px solid #2a3a5e; border-radius: 10px;
-      cursor: pointer; transition: border-color .15s, background .15s;
-    }
-    .mode:hover { border-color: #4a6cb0; }
-    .mode.on { border-color: #6f9bff; background: #14213d; }
-    .mode b { display: block; font-size: 14px; margin-bottom: 4px; }
-    .mode span { font-size: 12px; color: #8b96ad; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
-    label { display: block; font-size: 12px; color: #aab4c8; margin-bottom: 5px; }
-    input[type="text"], input[type="password"] {
-      width: 100%; padding: 9px 11px; font-size: 13px; color: #eef2ff;
-      background: #0d1425; border: 1px solid #2a3a5e; border-radius: 8px; outline: none;
-    }
-    input:focus { border-color: #6f9bff; }
-    button {
-      padding: 8px 16px; font-size: 13px; font-weight: 600; color: #fff;
-      background: linear-gradient(135deg, #3b6cf0, #6f9bff);
-      border: none; border-radius: 8px; cursor: pointer;
-    }
-    button:hover { filter: brightness(1.12); }
-    button.ghost { background: #1a2540; border: 1px solid #33477a; }
-    button.danger { background: #7a2f3a; }
-    button:disabled { opacity: .45; cursor: not-allowed; }
-    .row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
-    .row > div { flex: 1 1 180px; }
-    .actions { margin-top: 14px; display: flex; gap: 10px; align-items: center; }
-    .msg { font-size: 12px; margin-left: 6px; }
-    .msg.ok { color: #7fe3a0; }
-    .msg.err { color: #ff9b9b; }
-    .snap-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
-    .snap-col { background: #0d1425; border: 1px solid #2a3a5e; border-radius: 10px; padding: 12px 14px; }
-    .snap-col h3 {
-      font-size: 13px; color: #cdd9f2; margin-bottom: 8px;
-      display: flex; justify-content: space-between; align-items: center;
-    }
-    .snap-col h3 .cnt { font-size: 11px; color: #8b96ad; }
-    .snap-col ul { list-style: none; }
-    .snap-col li {
-      font-size: 11px; color: #9aa7c4; padding: 4px 0;
-      border-top: 1px dashed #22304f; word-break: break-all;
-    }
-    .snap-col .empty { color: #5d6782; font-size: 12px; padding: 6px 0; }
-    .switch { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #aab4c8; }
-    .switch input { accent-color: #6f9bff; }
-    #tokenOnce {
-      margin-top: 10px; padding: 9px 11px; font-size: 12px; display: none;
-      color: #ffe2a8; background: rgba(240, 180, 60, .1);
-      border: 1px solid rgba(240, 180, 60, .35); border-radius: 8px; word-break: break-all;
-    }
-  </style>
-</head>
-<body>
-<div class="wrap">
-  <header>
-    <div class="logo">Synapse<span class="accent">Mind</span> · 设置</div>
-    <nav><a href="/">← 返回控制台</a></nav>
-  </header>
+{% extends "base.html" %}
+
+{% block title %}设置{% endblock %}
+
+{% block head %}
+<style>
+  /* 页面专属样式（底座已由 app.css 收编）：设置页窄栏 + 模式卡 + 快照列 + 诊断/横幅 */
+  .wrap { max-width: 880px; }
+  .modes { display: flex; gap: 10px; flex-wrap: wrap; }
+  .mode {
+    flex: 1 1 200px; padding: 12px 14px;
+    background: #0d1425; border: 1px solid #2a3a5e; border-radius: 10px;
+    cursor: pointer; transition: border-color .15s, background .15s;
+  }
+  .mode:hover { border-color: #4a6cb0; }
+  .mode.on { border-color: #6f9bff; background: #14213d; }
+  .mode b { display: block; font-size: 14px; margin-bottom: 4px; }
+  .mode span { font-size: 12px; color: #8b96ad; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+  button.danger { background: #7a2f3a; }
+  .snap-cols { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+  .snap-col { background: #0d1425; border: 1px solid #2a3a5e; border-radius: 10px; padding: 12px 14px; }
+  .snap-col h3 {
+    font-size: 13px; color: #cdd9f2; margin-bottom: 8px;
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .snap-col h3 .cnt { font-size: 11px; color: #8b96ad; }
+  .snap-col ul { list-style: none; }
+  .snap-col li {
+    font-size: 11px; color: #9aa7c4; padding: 4px 0;
+    border-top: 1px dashed #22304f; word-break: break-all;
+  }
+  .snap-col .empty { color: #5d6782; font-size: 12px; padding: 6px 0; }
+  .switch { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: #aab4c8; }
+  .switch input { accent-color: #6f9bff; }
+  #tokenOnce {
+    margin-top: 10px; padding: 9px 11px; font-size: 12px; display: none;
+    color: #ffe2a8; background: rgba(240, 180, 60, .1);
+    border: 1px solid rgba(240, 180, 60, .35); border-radius: 8px; word-break: break-all;
+  }
+  /* Task 10.2: 存储诊断条 + env 密码接管横幅 */
+  .diag {
+    font-size: 12px; color: #8b96ad; line-height: 1.8;
+    background: rgba(17, 24, 39, .6); border: 1px dashed #2a3a5e;
+    border-radius: 8px; padding: 8px 12px; margin-bottom: 14px;
+    word-break: break-all;
+  }
+  .diag b { color: #cdd9f2; }
+  .diag .warn { color: #ffb37a; }
+  .banner {
+    display: none; font-size: 13px; line-height: 1.8; color: #ffe2a8;
+    background: rgba(240, 180, 60, .08); border: 1px solid rgba(240, 180, 60, .35);
+    border-radius: 10px; padding: 12px 14px; margin-bottom: 18px;
+  }
+  .banner b { color: #ffd27a; }
+</style>
+{% endblock %}
+
+{% block content %}
+<!-- Task 10.2: env 密码接管横幅（boot 时按 /settings/api/storage.env_password_active 显示） -->
+<div class="banner" id="envBanner">
+  <b>🔐 登录密码当前由环境变量接管</b><br>
+  环境变量 <b id="envVarName">SYNAPSEMIND_WEB_PASSWORD</b> 已设置且优先于配置文件——
+  这是<b>刻意的安全设计</b>：环境变量密码以明文仅在内存中恒时比较，<b>永不写入 config.json</b>（零落盘痕迹，轮换只需更新环境变量并重启）。<br>
+  因此「配置文件里看不到密码」属正常现象；下方设置页改密在接管期间也不生效，已为您禁用。
+</div>
+
+<!-- Task 10.2: 存储诊断条（配置文件实际落盘路径，避免「保存了却找不到」的误判） -->
+<div class="diag" id="diagBar">存储诊断加载中…</div>
 
   <!-- 运行模式 -->
   <div class="card">
@@ -187,8 +158,9 @@
       </div>
     </div>
   </div>
-</div>
+{% endblock %}
 
+{% block scripts %}
 <script>
 const $ = (id) => document.getElementById(id);
 const setMsg = (id, text, ok) => { const el = $(id); el.textContent = text; el.className = 'msg ' + (ok ? 'ok' : 'err'); };
@@ -206,6 +178,11 @@ async function api(path, opts = {}) {
 }
 
 let currentMode = 'manual';
+// Task 10.2: 配置文件实际落盘路径（boot 时读入）；保存成功提示带路径，杜绝「存哪了」的困惑
+let configPath = '';
+// Task 10.2: env 密码接管状态（boot 时读入）；接管期间前端预拦截改密并展示横幅
+let envPwdActive = false;
+const savedMsg = (id, text) => setMsg(id, `✓ ${text} → ${configPath || '配置文件'}`, true);
 document.querySelectorAll('.mode').forEach(el => {
   el.addEventListener('click', () => {
     currentMode = el.dataset.mode;
@@ -219,6 +196,8 @@ $('btnMode').addEventListener('click', async () => {
 });
 
 $('btnPwd').addEventListener('click', async () => {
+  // Task 10.2: env 接管期间前端预拦截（后端 400 兜底），避免用户改了个寂寞
+  if (envPwdActive) return setMsg('msgSec', '✗ 密码由环境变量接管中，设置页改密不生效', false);
   if ($('pwd1').value.length < 6) return setMsg('msgSec', '✗ 密码至少 6 位', false);
   if ($('pwd1').value !== $('pwd2').value) return setMsg('msgSec', '✗ 两次输入不一致', false);
   try { await api('/settings/api/password', { method: 'POST', body: { password: $('pwd1').value } });
@@ -236,20 +215,20 @@ $('btnToken').addEventListener('click', async () => {
 $('btnLlm').addEventListener('click', async () => {
   try { await api('/settings/api/llm', { method: 'POST', body: {
     base_url: $('llm_base').value.trim(), api_key: $('llm_key').value.trim(), model: $('llm_model').value.trim() }});
-    setMsg('msgLlm', '✓ 已保存', true); } catch (e) { setMsg('msgLlm', '✗ ' + e.message, false); }
+    savedMsg('msgLlm', 'LLM 配置已保存'); } catch (e) { setMsg('msgLlm', '✗ ' + e.message, false); }
 });
 
 $('btnS3').addEventListener('click', async () => {
   try { await api('/settings/api/s3', { method: 'POST', body: {
     endpoint_url: $('s3_endpoint').value.trim(), access_key_id: $('s3_ak').value.trim(),
     secret_access_key: $('s3_sk').value.trim(), bucket: $('s3_bucket').value.trim() }});
-    setMsg('msgS3', '✓ 已保存', true); } catch (e) { setMsg('msgS3', '✗ ' + e.message, false); }
+    savedMsg('msgS3', 'S3 配置已保存'); } catch (e) { setMsg('msgS3', '✗ ' + e.message, false); }
 });
 
 $('btnPolicy').addEventListener('click', async () => {
   try { await api('/settings/api/backup_policy', { method: 'POST', body: {
     hourly_enabled: $('bp_hourly').checked, daily_enabled: $('bp_daily').checked }});
-    setMsg('msgBp', '✓ 策略已保存', true); } catch (e) { setMsg('msgBp', '✗ ' + e.message, false); }
+    savedMsg('msgBp', '备份策略已保存'); } catch (e) { setMsg('msgBp', '✗ ' + e.message, false); }
 });
 
 $('btnBackup').addEventListener('click', async (ev) => {
@@ -297,9 +276,26 @@ async function loadSnaps() {
     $('s3_sk').placeholder = d.s3.has_secret ? '已配置（留空则不修改）' : '';
     $('bp_hourly').checked = !!d.backup_policy.hourly_enabled;
     $('bp_daily').checked = !!d.backup_policy.daily_enabled;
+
+    // ── Task 10.2: 存储诊断条 + env 密码接管横幅 ──
+    const st = d.storage || {};
+    configPath = st.config_path || '';
+    envPwdActive = !!st.env_password_active;
+    const writable = st.data_dir_writable
+      ? '<b style="color:#7fe3a0">可写</b>（配置持久化到挂载盘，重启不丢）'
+      : '<span class="warn">不可写</span>（已回退本地运行时目录，<b>容器重建后配置会丢失</b>，请检查 /data 挂载）';
+    $('diagBar').innerHTML =
+      `🗂 配置文件实际路径：<b>${configPath || '（尚未落盘）'}</b><br>` +
+      `💾 /data 挂载盘：${writable}<br>` +
+      `<span style="color:#5d6782">提示：LLM/S3/备份策略保存后即写入上述路径；若您查看的是其它位置的 config.json，自然看不到变化。</span>`;
+    if (envPwdActive) {
+      $('envVarName').textContent = st.env_password_var || 'SYNAPSEMIND_WEB_PASSWORD';
+      $('envBanner').style.display = 'block';
+      $('btnPwd').disabled = true;
+      $('pwd1').value = $('pwd2').value = '';
+    }
   } catch (e) { console.error('boot 失败', e); }
   await loadSnaps();
 })();
 </script>
-</body>
-</html>
+{% endblock %}

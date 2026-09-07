@@ -1,0 +1,177 @@
+{% extends "base.html" %}
+
+{% block title %}图谱推演{% endblock %}
+
+{% block head %}<script src="/static/js/graph_view.js" defer></script>{% endblock %}
+
+{% block content %}
+<!-- 神经图谱视口（Task 6.3.1 局部视口宿主 + Task 6.3.2 脉冲动画画布） -->
+<div class="card" id="graphArea">
+  <h2>① 神经图谱视口（局部视口 · 仅渲染已确认知识）</h2>
+  <div id="graphCanvas"></div>
+</div>
+
+<!-- 纯图推演看板（Task 6.3.2：脉冲动画 + 真实证据链打印） -->
+<div class="card">
+  <h2>② 纯图推演（能量扩散 · 结论与证据链 100% 可回溯）</h2>
+  <div class="row">
+    <div><label>推演线索 *</label><input type="text" id="dClue" list="dlConcepts" placeholder="如：恶寒 发热" maxlength="256"></div>
+  </div>
+  <datalist id="dlConcepts"></datalist>
+  <div class="actions">
+    <button id="btnReason">开始推演</button>
+    <button class="ghost" id="btnPulseReplay" type="button" hidden>↻ 重播脉冲</button>
+    <span class="msg" id="msgD"></span>
+  </div>
+  <div id="reasonOut"></div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&#39;", "'": "&#39;" }[ch]));
+
+function setMsg(id, text, ok) {
+  const el = $(id);
+  el.textContent = text;
+  el.className = "msg " + (ok ? "ok" : "err");
+}
+
+async function api(path, opts = {}) {
+  const init = { method: opts.method || "GET", headers: {} };
+  if (opts.body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(opts.body);
+  }
+  const resp = await fetch(path, init);
+  let data = {};
+  try { data = await resp.json(); } catch (_) { /* 非 JSON（如 302 登录页） */ }
+  if (!resp.ok) {
+    const d = data.detail;
+    const text = Array.isArray(d)
+      ? d.map((e) => `${(e.loc || []).slice(1).join(".")}: ${e.msg}`).join("；")
+      : (d || `HTTP ${resp.status}`);
+    throw new Error(text);
+  }
+  return data;
+}
+
+// 概念下拉缓存（推演线索 datalist 用）
+async function loadConcepts() {
+  const d = await api("/api/concepts");
+  $("dlConcepts").innerHTML = (d.items || []).map(
+    (c) => `<option value="${esc(c.name)}">${esc(c.id)} · ${esc(c.category)}</option>`
+  ).join("");
+}
+
+// ── 纯图推演看板（Task 6.3.2：神经脉冲动画 + 真实证据链打印）──
+// 铁律对齐：结论与证据 100% 来自 /api/reason 返回的真实激活链，
+// 前端只负责可视化与打印，绝不自行推断、修饰或编造任何"证据"。
+let lastReason = null;   // 缓存最近一次推演结果（重播脉冲用）
+
+function renderReason(d) {
+  const out = $("reasonOut");
+  if (d.status !== "ok" || !d.answer) {
+    out.innerHTML = `<div class="empty">${esc(d.message || "推演无结论")}</div>`;
+    return;
+  }
+  const a = d.answer;
+  // id → 概念名 映射：以推演返回为准（图内概念可能超出页面 500 条缓存）
+  const names = new Map();
+  for (const act of d.activations || []) if (act.name) names.set(act.id, act.name);
+  if (a.conclusion && a.conclusion.name) names.set(a.conclusion.id, a.conclusion.name);
+  for (const c of (a.assertion && a.assertion.conditions) || []) if (c.name) names.set(c.id, c.name);
+  const nm = (id) => esc(names.get(id) || String(id).slice(0, 12));
+
+  const condHtml = a.assertion
+    ? `<div style="margin:8px 0 2px;font-size:12.5px;color:#9fb3d9">规则断言命中（多前提汇流 fanin=${a.assertion.conditions.length}）：<b style="color:#ffd28a">${a.assertion.conditions.map((c) => esc(c.name)).join(" ＋ ")}</b> ⇒ <b style="color:#7fe3a0">${esc(a.conclusion.name)}</b></div>`
+    : `<div style="margin:8px 0 2px;font-size:12.5px;color:#9fb3d9">无多前提断言命中，结论取自峰值最高的传导激活节点（单链推演）。</div>`;
+
+  // 结论路径证据链：逐跳打印真实 evidence 原文（缺失时如实标注，不补造）
+  const chainRows = (a.chain || []).map((s, i) => `
+    <div style="display:flex;gap:10px;flex-wrap:wrap;padding:7px 10px;border-left:3px solid #ffd28a;background:#101a30;border-radius:6px;margin:6px 0;font-size:12.5px">
+      <span style="color:#5d6f94;white-space:nowrap">第 ${i + 1} 跳</span>
+      <span style="white-space:nowrap">${nm(s.src_id)} <span style="color:#ffd28a">—[${esc(s.relation || "relates")}]→</span> ${nm(s.dst_id)}</span>
+      <span style="color:#9fb3d9;flex:1;min-width:200px">证据：${s.evidence ? esc(s.evidence) : "（该突触未录入证据文本）"}</span>
+    </div>`).join("");
+
+  const assertionEvi = (a.assertion && a.assertion.evidence && a.assertion.evidence.length)
+    ? `<div style="margin-top:8px;font-size:12.5px;color:#9fb3d9">断言出处（各前提→结论突触 evidence 原文）：</div>` +
+      a.assertion.evidence.map((e) =>
+        `<div style="padding:5px 10px;border-left:3px solid #7fe3a0;background:#0f1d2e;border-radius:6px;margin:5px 0;font-size:12.5px">${esc(e)}</div>`
+      ).join("")
+    : "";
+
+  const actRows = (d.activations || []).map((act, i) => `
+    <tr>
+      <td style="padding:5px 8px;color:#5d6f94">${i + 1}</td>
+      <td style="padding:5px 8px">${esc(act.name || act.id)}</td>
+      <td style="padding:5px 8px;color:#ffd28a">${act.hop ?? "-"}</td>
+      <td style="padding:5px 8px;color:#7fe3a0">${Number(act.peak || 0).toFixed(3)}</td>
+    </tr>`).join("");
+
+  out.innerHTML = `
+    <div style="border:1px solid #23324f;border-radius:10px;padding:12px 14px;background:#0c1425">
+      <div style="font-size:13px;color:#9fb3d9">推演结论</div>
+      <div style="font-size:18px;font-weight:700;margin:4px 0">${esc(a.conclusion.name || a.conclusion.id)}
+        <span style="font-size:12px;color:#5d6f94;font-weight:400">${esc(a.conclusion.category || "")} · 峰值 ${Number(a.peak || 0).toFixed(3)} · 第 ${a.hop ?? "-"} 跳激活</span>
+      </div>
+      ${condHtml}
+      <div style="margin-top:10px;font-size:13px;color:#dbe4f7">真实证据链（结论路径逐跳可回溯）</div>
+      ${chainRows || '<div class="empty">结论即线索命中概念，无传导边。</div>'}
+      ${assertionEvi}
+      <details style="margin-top:10px">
+        <summary style="cursor:pointer;font-size:12.5px;color:#9fb3d9">激活序列（按峰值能量降序，共 ${(d.activations || []).length} 节点）</summary>
+        <table style="width:100%;border-collapse:collapse;font-size:12.5px;margin-top:6px">
+          <thead><tr style="color:#5d6f94;text-align:left"><th style="padding:5px 8px">#</th><th style="padding:5px 8px">概念</th><th style="padding:5px 8px">跳</th><th style="padding:5px 8px">峰值能量</th></tr></thead>
+          <tbody>${actRows}</tbody>
+        </table>
+      </details>
+    </div>`;
+}
+
+async function runReason() {
+  const clue = $("dClue").value.trim();
+  if (!clue) { setMsg("msgD", "请输入推演线索", false); return; }
+  $("btnReason").disabled = true;
+  setMsg("msgD", "推演中…（阻尼能量扩散）", true);
+  try {
+    const d = await api("/api/reason", { method: "POST", body: { clue } });
+    lastReason = d;
+    renderReason(d);
+    const hasPulse = !!(window.SynapseGraph && typeof window.SynapseGraph.playPulse === "function");
+    $("btnPulseReplay").hidden = !(hasPulse && d.activations && d.activations.length);
+    if (hasPulse) {
+      // 先在图视口渲染激活子图（绿描边），再按扩散时序播放神经脉冲
+      await window.SynapseGraph.renderActivation({
+        node_ids: (d.activations || []).map((x) => x.id),
+        title: `「${clue}」推演激活`,
+      });
+      await window.SynapseGraph.playPulse(d.activations);
+      setMsg("msgD", "✓ 推演完成（脉冲已按扩散时序播放）", true);
+    } else {
+      setMsg("msgD", "✓ 推演完成（图视图未就绪，仅打印证据链）", true);
+    }
+  } catch (e) {
+    setMsg("msgD", "✗ " + e.message, false);
+  } finally {
+    $("btnReason").disabled = false;
+  }
+}
+
+$("btnReason").addEventListener("click", runReason);
+$("dClue").addEventListener("keydown", (ev) => { if (ev.key === "Enter") runReason(); });
+$("btnPulseReplay").addEventListener("click", async () => {
+  if (!lastReason || !window.SynapseGraph || typeof window.SynapseGraph.playPulse !== "function") return;
+  $("btnPulseReplay").disabled = true;
+  try { await window.SynapseGraph.playPulse(lastReason.activations); }
+  catch (e) { setMsg("msgD", "✗ 脉冲重播失败：" + e.message, false); }
+  finally { $("btnPulseReplay").disabled = false; }
+});
+
+(async function boot() {
+  try { await loadConcepts(); }
+  catch (e) { console.error("概念列表加载失败", e); }
+})();
+</script>
+{% endblock %}

@@ -1,0 +1,235 @@
+{% extends "base.html" %}
+
+{% block title %}手工编辑{% endblock %}
+
+{% block content %}
+<!-- ①：建立概念节点（含相近词弱提示流程） -->
+<div class="card">
+  <h2>① 建立概念节点</h2>
+  <div class="row">
+    <div><label>概念名 *</label><input type="text" id="cName" placeholder="如：恶寒" maxlength="64"></div>
+    <div><label>分类标签 *</label><input type="text" id="cCat" placeholder="如：症状 / 证型 / 方剂" maxlength="32"></div>
+    <div><label>释义（可选）</label><input type="text" id="cDesc" placeholder="概念简要说明" maxlength="500"></div>
+  </div>
+  <div class="actions">
+    <button id="btnConcept">创建概念</button><span class="msg" id="msgC"></span>
+  </div>
+</div>
+
+<!-- ②：突触连线（录入即确认） -->
+<div class="card">
+  <h2>② 突触连线（手工录入即确认，直接进入已学知识）</h2>
+  <div class="row">
+    <div><label>起点概念 *</label><input type="text" list="dlConcepts" id="sSrc" placeholder="输入或选择概念名"></div>
+    <div><label>终点概念 *</label><input type="text" list="dlConcepts" id="sDst" placeholder="输入或选择概念名"></div>
+    <div><label>关系标签 *</label><input type="text" id="sRel" placeholder="causes / inhibits / relates" maxlength="64"></div>
+  </div>
+  <div class="row" style="margin-top:12px">
+    <div>
+      <label>传导权重 <b id="wVal" style="color:#9fc0ff">0.50</b>（能量扩散系数 ∈ [0,1]）</label>
+      <input type="range" id="sW" min="0" max="1" step="0.05" value="0.5">
+    </div>
+    <div><label>证据 / 出处（可选，推演回溯用）</label><input type="text" id="sEv" maxlength="1000"></div>
+  </div>
+  <datalist id="dlConcepts"></datalist>
+  <div class="actions">
+    <button id="btnSyn">创建连线</button><span class="msg" id="msgS"></span>
+  </div>
+</div>
+
+<!-- ③：规则断言（A + B 导致 C） -->
+<div class="card">
+  <h2>③ 规则断言（多前提组合 → 单一结论，物化为前提→结论突触）</h2>
+  <label>前提条件（1~8 个，按概念名）</label>
+  <div id="condRows"></div>
+  <button class="ghost" id="btnAddCond" type="button">+ 添加前提</button>
+  <div class="row" style="margin-top:12px">
+    <div><label>结论概念 *</label><input type="text" list="dlConcepts" id="rConc" placeholder="如：太阳伤寒证"></div>
+    <div><label>断言出处（可选，经典条文/医案）</label><input type="text" id="rEv" maxlength="1000"></div>
+  </div>
+  <div class="actions">
+    <button id="btnRule">录入断言</button><span class="msg" id="msgR"></span>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<!-- 相近词弱提示弹窗（红线：仅提示，绝不自动合并/改名） -->
+<div class="mask" id="simMask" hidden>
+  <div class="modal">
+    <h3>⚠ 发现相近概念</h3>
+    <p id="simHint"></p>
+    <ul id="simList"></ul>
+    <div class="actions">
+      <button id="simForce">确认为不同概念，仍要新建</button>
+      <button class="ghost" id="simLink">取消建点，改用相近概念连线</button>
+      <button class="ghost" id="simCancel">取消</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+
+function setMsg(id, text, ok) {
+  const el = $(id);
+  el.textContent = text;
+  el.className = "msg " + (ok ? "ok" : "err");
+}
+
+async function api(path, opts = {}) {
+  const init = { method: opts.method || "GET", headers: {} };
+  if (opts.body !== undefined) {
+    init.headers["Content-Type"] = "application/json";
+    init.body = JSON.stringify(opts.body);
+  }
+  const resp = await fetch(path, init);
+  let data = {};
+  try { data = await resp.json(); } catch (_) { /* 非 JSON（如 302 登录页） */ }
+  if (!resp.ok) {
+    const d = data.detail;
+    const text = Array.isArray(d)
+      ? d.map((e) => `${(e.loc || []).slice(1).join(".")}: ${e.msg}`).join("；")
+      : (d || `HTTP ${resp.status}`);
+    throw new Error(text);
+  }
+  return data;
+}
+
+// ── 概念缓存与选择器 ──
+let CONCEPTS = [];
+
+async function loadConcepts() {
+  const d = await api("/api/concepts");
+  CONCEPTS = d.items || [];
+  $("dlConcepts").innerHTML = CONCEPTS.map(
+    (c) => `<option value="${esc(c.name)}">${esc(c.id)} · ${esc(c.category)}</option>`
+  ).join("");
+}
+
+const idByName = (name) => {
+  const hit = CONCEPTS.find((c) => c.name === name);
+  return hit ? hit.id : null;
+};
+
+// ── ① 建点（含相近词弱提示流程）──
+let pendingConcept = null;   // 弹窗期间暂存的表单值
+
+async function submitConcept(force) {
+  const body = {
+    name: $("cName").value, category: $("cCat").value, description: $("cDesc").value,
+  };
+  if (force) body.force = true;
+  const resp = await api("/api/concepts", { method: "POST", body });
+  if (resp.created) {
+    setMsg("msgC", `✓ 概念已创建（id=${resp.id}）`, true);
+    $("cName").value = ""; $("cDesc").value = "";
+    await loadConcepts();
+    return true;
+  }
+  // 命中弱提示：弹窗交人工裁决（仅提示，绝不自动合并）
+  pendingConcept = body;
+  const sim = resp.similarity;
+  $("simHint").textContent = sim.hint || "发现相近的既有概念，请人工裁决：";
+  $("simList").innerHTML = (sim.candidates || []).map((c) =>
+    `<li><b>${esc(c.name)}</b>（${esc(c.category)}）<span class="score">相似度 ${c.score}%</span>` +
+    (c.description ? `<br>${esc(c.description)}` : "") + `</li>`
+  ).join("");
+  $("simMask").hidden = false;
+  return false;
+}
+
+$("btnConcept").addEventListener("click", async (ev) => {
+  ev.target.disabled = true; setMsg("msgC", "提交中…", true);
+  try { await submitConcept(false); }
+  catch (e) { setMsg("msgC", "✗ " + e.message, false); }
+  finally { ev.target.disabled = false; }
+});
+
+$("simForce").addEventListener("click", async () => {
+  $("simMask").hidden = true;
+  try {
+    const ok = await submitConcept(true);
+    if (ok) setMsg("msgC", "✓ 已确认为不同概念并创建", true);
+  } catch (e) { setMsg("msgC", "✗ " + e.message, false); }
+});
+
+$("simLink").addEventListener("click", () => {
+  // 放弃建点：把相近既有概念填入连线起点，新名填入终点，引导人工建立关联
+  const first = document.querySelector("#simList li b");
+  if (first) $("sSrc").value = first.textContent;
+  $("sDst").value = pendingConcept ? pendingConcept.name : "";
+  $("cName").value = "";
+  $("simMask").hidden = true;
+  setMsg("msgC", "已取消建点，可在下方 ② 中为两个概念建立连线", true);
+  $("sDst").focus();
+});
+
+$("simCancel").addEventListener("click", () => { $("simMask").hidden = true; });
+
+// ── ② 连线 ──
+$("sW").addEventListener("input", () => { $("wVal").textContent = Number($("sW").value).toFixed(2); });
+
+$("btnSyn").addEventListener("click", async (ev) => {
+  ev.target.disabled = true; setMsg("msgS", "提交中…", true);
+  try {
+    const srcName = $("sSrc").value.trim(), dstName = $("sDst").value.trim();
+    const srcId = idByName(srcName), dstId = idByName(dstName);
+    if (!srcId) throw new Error(`起点概念不存在：${srcName}，请先在 ① 中建点`);
+    if (!dstId) throw new Error(`终点概念不存在：${dstName}，请先在 ① 中建点`);
+    const resp = await api("/api/synapses", {
+      method: "POST",
+      body: {
+        src_id: srcId, dst_id: dstId,
+        relation: $("sRel").value, weight: Number($("sW").value),
+        evidence: $("sEv").value,
+      },
+    });
+    setMsg("msgS", `✓ 连线已确认入库（rel_id=${resp.rel_id}）`, true);
+    $("sRel").value = ""; $("sEv").value = "";
+  } catch (e) { setMsg("msgS", "✗ " + e.message, false); }
+  finally { ev.target.disabled = false; }
+});
+
+// ── ③ 规则断言：动态前提行 ──
+function addCondRow(value = "") {
+  const rows = document.querySelectorAll(".cond-row");
+  if (rows.length >= 8) { setMsg("msgR", "✗ 前提条件最多 8 个", false); return; }
+  const div = document.createElement("div");
+  div.className = "cond-row";
+  div.innerHTML =
+    `<input type="text" list="dlConcepts" class="condInput" placeholder="前提概念名" maxlength="64" value="${esc(value)}">` +
+    `<button class="rm" type="button">移除</button>`;
+  div.querySelector(".rm").addEventListener("click", () => {
+    if (document.querySelectorAll(".cond-row").length <= 1) { setMsg("msgR", "至少保留 1 个前提", false); return; }
+    div.remove();
+  });
+  $("condRows").appendChild(div);
+}
+addCondRow(); addCondRow();
+$("btnAddCond").addEventListener("click", () => addCondRow());
+
+$("btnRule").addEventListener("click", async (ev) => {
+  ev.target.disabled = true; setMsg("msgR", "提交中…", true);
+  try {
+    const conditions = [...document.querySelectorAll(".condInput")]
+      .map((i) => i.value.trim()).filter(Boolean);
+    const resp = await api("/api/rules", {
+      method: "POST",
+      body: { conditions, conclusion: $("rConc").value, evidence: $("rEv").value },
+    });
+    setMsg("msgR", `✓ 断言已物化为 ${resp.fanin} 条已确认突触`, true);
+    $("rConc").value = ""; $("rEv").value = "";
+    document.querySelectorAll(".condInput").forEach((i) => { i.value = ""; });
+  } catch (e) { setMsg("msgR", "✗ " + e.message, false); }
+  finally { ev.target.disabled = false; }
+});
+
+(async function boot() {
+  try { await loadConcepts(); }
+  catch (e) { console.error("概念列表加载失败", e); }
+})();
+</script>
+{% endblock %}
