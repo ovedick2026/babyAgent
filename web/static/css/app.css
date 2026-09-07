@@ -1,0 +1,182 @@
+/* SynapseMind 控制台共享样式 (web/static/css/app.css)
+ *
+ * Task 11.5: 从 index.html 内联样式提取的设计令牌全量收编，
+ * 供 base.html 框架与各子页（图谱/工坊/手工/设置）共用。
+ * 新增：进度条 / 状态徽章 / 待提炼行 / 底部标签栏（≤640px 手机适配）。
+ */
+
+:root { color-scheme: dark; }
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  min-height: 100vh;
+  background: radial-gradient(1200px 600px at 20% -10%, #1b2a4a 0%, #0b1120 55%, #070b14 100%);
+  font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+  color: #e5eaf5;
+  padding: 28px 16px 60px;
+}
+.wrap { max-width: 920px; margin: 0 auto; }
+
+/* ── 顶导航 ─────────────────────────────── */
+header {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 26px;
+}
+.logo { font-size: 20px; font-weight: 700; letter-spacing: 1px; }
+.logo .accent { color: #6f9bff; }
+nav.main-nav { display: flex; align-items: center; gap: 14px; }
+nav.main-nav a { color: #8fa3c8; text-decoration: none; font-size: 13px; }
+nav.main-nav a:hover { color: #cdd9f2; }
+nav.main-nav a.active { color: #9fc0ff; font-weight: 600; }
+nav.main-nav form { display: inline; }
+
+/* ── 卡片 ───────────────────────────────── */
+.card {
+  background: rgba(17, 24, 39, .85);
+  border: 1px solid rgba(99, 132, 255, .18);
+  border-radius: 12px;
+  padding: 22px 24px;
+  margin-bottom: 18px;
+}
+.card h2 {
+  font-size: 15px; font-weight: 600; color: #9fc0ff;
+  margin-bottom: 14px; letter-spacing: .5px;
+}
+
+/* ── 表单 ───────────────────────────────── */
+label { display: block; font-size: 12px; color: #aab4c8; margin-bottom: 5px; }
+input[type="text"], input[type="password"], textarea {
+  width: 100%; padding: 9px 11px; font-size: 13px; color: #eef2ff;
+  background: #0d1425; border: 1px solid #2a3a5e; border-radius: 8px; outline: none;
+}
+input:focus, textarea:focus { border-color: #6f9bff; }
+textarea { resize: vertical; min-height: 120px; line-height: 1.6; }
+input[type="range"] { width: 100%; accent-color: #6f9bff; }
+input[type="file"] { font-size: 12px; color: #8fa3c8; }
+
+/* ── 按钮 ───────────────────────────────── */
+button {
+  padding: 8px 16px; font-size: 13px; font-weight: 600; color: #fff;
+  background: linear-gradient(135deg, #3b6cf0, #6f9bff);
+  border: none; border-radius: 8px; cursor: pointer;
+}
+button:hover { filter: brightness(1.12); }
+button.ghost { background: #1a2540; border: 1px solid #33477a; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+.row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+.row > div { flex: 1 1 180px; }
+.actions { margin-top: 14px; display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+.msg { font-size: 12px; margin-left: 6px; }
+.msg.ok { color: #7fe3a0; }
+.msg.err { color: #ff9b9b; }
+.empty { color: #5d6782; font-size: 12px; padding: 6px 0; }
+
+/* ── 相近词弱提示弹窗 ───────────────────── */
+.mask {
+  position: fixed; inset: 0; background: rgba(4, 8, 18, .72);
+  display: flex; align-items: center; justify-content: center; z-index: 50;
+}
+.mask[hidden] { display: none; }
+.modal {
+  width: min(560px, 92vw); background: #101a30;
+  border: 1px solid #3a5390; border-radius: 14px; padding: 22px 24px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, .55);
+}
+.modal h3 { font-size: 15px; color: #ffd28a; margin-bottom: 10px; }
+.modal p { font-size: 13px; color: #cdd9f2; margin-bottom: 12px; line-height: 1.6; }
+.modal ul { list-style: none; margin-bottom: 16px; }
+.modal li {
+  font-size: 12px; color: #9aa7c4; padding: 8px 10px;
+  background: #0d1425; border: 1px solid #22304f; border-radius: 8px;
+  margin-bottom: 6px; line-height: 1.55;
+}
+.modal li b { color: #e8eefc; font-size: 13px; }
+.modal li .score { color: #ffd28a; }
+
+/* ── 待收纳池 · 人机共审列表 ─────────────── */
+.pend-row {
+  display: flex; gap: 12px; align-items: flex-start;
+  background: #0d1425; border: 1px solid #22304f; border-radius: 10px;
+  padding: 12px 14px; margin-bottom: 10px;
+}
+.pend-row input[type="checkbox"] { margin-top: 5px; accent-color: #6f9bff; }
+.pend-main { flex: 1; min-width: 0; }
+.pend-title { font-size: 13px; color: #e8eefc; margin-bottom: 4px; }
+.pend-title .arrow { color: #6f9bff; margin: 0 4px; }
+.pend-title .tag {
+  display: inline-block; margin-left: 8px; padding: 1px 8px;
+  font-size: 11px; color: #ffd28a; background: #2a2130;
+  border: 1px solid #5e4a33; border-radius: 999px;
+}
+.pend-ev { font-size: 11px; color: #8fa3c8; margin-bottom: 8px; word-break: break-all; }
+.pend-ops { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.pend-ops input[type="range"] { width: 140px; }
+.pend-ops .wv { font-size: 12px; color: #9fc0ff; min-width: 36px; }
+.pend-ops input[type="text"].pRel {
+  width: 120px; padding: 5px 8px; font-size: 12px;
+  background: #0a1120; border-radius: 6px;
+}
+.pend-ops button { padding: 5px 12px; font-size: 12px; }
+.pend-ops button.danger { background: #3a1a24; border: 1px solid #7a3347; }
+.selbar { font-size: 12px; color: #8fa3c8; margin-left: auto; }
+
+/* ── 状态徽章（提炼四态） ────────────────── */
+.badge {
+  display: inline-block; padding: 2px 10px; font-size: 11px; font-weight: 600;
+  border-radius: 999px; border: 1px solid transparent; white-space: nowrap;
+}
+.badge.QUEUED  { color: #9fc0ff; background: #14203a; border-color: #33477a; }
+.badge.RUNNING { color: #ffd28a; background: #2a2130; border-color: #5e4a33; }
+.badge.PAUSED  { color: #c9a7ff; background: #221a38; border-color: #4a337a; }
+.badge.DONE    { color: #7fe3a0; background: #12291c; border-color: #2f5e44; }
+.badge.FAILED  { color: #ff9b9b; background: #2a1218; border-color: #7a3347; }
+
+/* ── 提炼进度条 ─────────────────────────── */
+.progress-track {
+  width: 100%; height: 8px; border-radius: 999px;
+  background: #0a1120; border: 1px solid #22304f; overflow: hidden;
+}
+.progress-fill {
+  height: 100%; width: 0;
+  background: linear-gradient(90deg, #3b6cf0, #6f9bff);
+  border-radius: 999px; transition: width .4s ease;
+}
+.progress-meta { font-size: 11px; color: #8fa3c8; margin-top: 5px; }
+
+/* ── 待提炼列表行 ───────────────────────── */
+.doc-row {
+  background: #0d1425; border: 1px solid #22304f; border-radius: 10px;
+  padding: 14px 16px; margin-bottom: 12px;
+}
+.doc-head { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
+.doc-title { font-size: 13px; font-weight: 600; color: #e8eefc; flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.doc-ops { display: flex; gap: 8px; flex-wrap: wrap; }
+.doc-ops button { padding: 5px 12px; font-size: 12px; }
+.doc-ops button.danger { background: #3a1a24; border: 1px solid #7a3347; }
+.doc-err { font-size: 11px; color: #ff9b9b; margin-top: 6px; word-break: break-all; }
+
+/* ── 手机适配（≤640px）：底部标签栏 ──────── */
+.tabbar {
+  display: none;
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 40;
+  background: rgba(13, 20, 37, .96); border-top: 1px solid #22304f;
+  padding: 6px 4px calc(6px + env(safe-area-inset-bottom));
+}
+.tabbar a {
+  flex: 1; text-align: center; text-decoration: none;
+  font-size: 11px; color: #8fa3c8; padding: 4px 0;
+}
+.tabbar a .ico { display: block; font-size: 17px; margin-bottom: 2px; }
+.tabbar a.active { color: #9fc0ff; font-weight: 600; }
+
+@media (max-width: 640px) {
+  body { padding: 18px 12px calc(72px + env(safe-area-inset-bottom)); }
+  header { margin-bottom: 18px; }
+  /* 桌面顶导航链接收起（登出表单保留），页面切换走底部标签栏 */
+  nav.main-nav a { display: none; }
+  nav.main-nav a.active { display: none; }
+  .card { padding: 16px 14px; }
+  .row > div { flex: 1 1 100%; }
+  .pend-ops input[type="range"] { width: 100%; }
+  .tabbar { display: flex; }
+}
