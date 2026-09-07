@@ -23,9 +23,18 @@ URL 拼接规则（OpenAI 兼容端点惯例）：
 - is_llm_configured()  三元组预检
 - chat_completion()    同步调用（脚本/自检用）
 - achat_completion()   异步调用（FastAPI 路由用，不阻塞事件循环）
+
+传输层韧性（Bugfix: SSL UNEXPECTED_EOF_WHILE_READING）：
+- 网关/代理在 TLS 握手或长连接上偶发切断（SSL EOF / 连接重置 / 读中断）
+  属瞬时故障，一次失败即抛会误伤「配置完全正确」的用户；
+- 因此对传输层瞬时错误做「至多 3 次尝试 + 指数退避」自动重试；
+- 客户端显式 trust_env=False：容器内 HTTP(S)_PROXY 环境变量常把
+  https 流量劫持到不支持 CONNECT 隧道的代理，正是 SSL EOF 高发源头；
+- 4xx（鉴权/参数错误）语义明确，绝不重试，避免无意义打点。
 """
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -36,6 +45,9 @@ logger = logging.getLogger("synapsemind.metabolism")
 
 # 默认请求超时（秒）：LLM 生成普遍较慢，取宽裕值；调用方可按场景覆盖
 DEFAULT_TIMEOUT = 120.0
+# 传输层瞬时故障自动重试：总尝试次数与指数退避基数秒
+LLM_MAX_ATTEMPTS = 3
+LLM_RETRY_BACKOFF = 1.5
 # 默认生成参数：代谢类任务（速读/拆解）要求稳定，temperature 取低值
 DEFAULT_TEMPERATURE = 0.2
 DEFAULT_MAX_TOKENS = 2048
@@ -121,6 +133,41 @@ def _wrap_http_error(exc: httpx.HTTPError) -> MetabolismError:
     return MetabolismError(f"LLM 请求失败: {exc}", cause=exc)
 
 
+def _is_transient_error(exc: BaseException) -> bool:
+    """判定是否为值得重试的传输层瞬时故障。
+
+    覆盖（Bugfix 实测）：SSL UNEXPECTED_EOF_WHILE_READING / ConnectionReset /
+    RemoteProtocolError(读中断) / ConnectError / 超时 / 5xx。
+    4xx 属语义明确的客户端错误（鉴权/参数），重试无意义，不在此列。
+    """
+    if isinstance(exc, (httpx.TimeoutException, httpx.TransportError)):
+        return True  # 含 SSL EOF、连接重置、读写中断、ConnectError 全族
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return False
+
+
+def _safe_client(timeout: float) -> httpx.Client:
+    """构造出站 HTTP 客户端。
+
+    trust_env=False（核心修复）：忽略 HTTP(S)_PROXY/NO_PROXY 等环境变量。
+    容器环境的代理变量常把 https 请求劫持到仅支持明文转发的代理，
+    TLS 握手被中途掐断即报 SSL: UNEXPECTED_EOF_WHILE_READING。
+    LLM 端点为用户显式配置的可信地址，直连即可，无需环境代理。
+    """
+    return httpx.Client(timeout=timeout, trust_env=False)
+
+
+def _async_safe_client(timeout: float) -> httpx.AsyncClient:
+    """异步版安全客户端，语义与 _safe_client 严格一致。"""
+    return httpx.AsyncClient(timeout=timeout, trust_env=False)
+
+
+def _retry_sleep(attempt: int) -> None:
+    """指数退避：第 1 次失败后 1.5s，第 2 次后 3s（attempt 从 1 计）。"""
+    time.sleep(LLM_RETRY_BACKOFF * attempt)
+
+
 def chat_completion(
     messages: List[Dict[str, str]],
     *,
@@ -128,19 +175,31 @@ def chat_completion(
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> str:
-    """同步版补全调用：返回首个 choice 文本；任何失败抛 MetabolismError。"""
+    """同步版补全调用：返回首个 choice 文本；任何失败抛 MetabolismError。
+
+    传输层瞬时故障（SSL EOF/连接重置/超时/5xx）自动重试至多
+    LLM_MAX_ATTEMPTS 次（指数退避）；4xx 等语义错误立即抛出。
+    """
     url = _endpoint_url()
     payload = _build_payload(messages, temperature=temperature, max_tokens=max_tokens)
-    logger.debug("LLM 同步请求 → %s (model=%s)", url, payload["model"])
-    try:
-        with httpx.Client(timeout=timeout) as client:
-            resp = client.post(url, json=payload, headers=_auth_headers())
-            resp.raise_for_status()
-            return _unwrap_response(resp.json())
-    except httpx.HTTPError as exc:
-        raise _wrap_http_error(exc) from exc
-    except ValueError as exc:  # resp.json() 解析失败
-        raise MetabolismError("LLM 响应不是合法 JSON", cause=exc) from exc
+    last_exc: Exception = MetabolismError("未执行")
+    for attempt in range(1, LLM_MAX_ATTEMPTS + 1):
+        try:
+            with _safe_client(timeout) as client:
+                resp = client.post(url, json=payload, headers=_auth_headers())
+                resp.raise_for_status()
+                return _unwrap_response(resp.json())
+        except httpx.HTTPError as exc:
+            last_exc = exc
+            if attempt < LLM_MAX_ATTEMPTS and _is_transient_error(exc):
+                logger.warning("LLM 传输层瞬时失败（第 %d/%d 次），退避后重试: %s",
+                               attempt, LLM_MAX_ATTEMPTS, exc)
+                _retry_sleep(attempt)
+                continue
+            raise _wrap_http_error(exc) from exc
+        except ValueError as exc:  # resp.json() 解析失败
+            raise MetabolismError("LLM 响应不是合法 JSON", cause=exc) from exc
+    raise _wrap_http_error(last_exc)  # 理论不可达，防御性兜底
 
 
 async def achat_completion(
@@ -150,19 +209,31 @@ async def achat_completion(
     max_tokens: int = DEFAULT_MAX_TOKENS,
     timeout: float = DEFAULT_TIMEOUT,
 ) -> str:
-    """异步版补全调用（FastAPI 路由专用，不阻塞事件循环）；语义与同步版严格一致。"""
+    """异步版补全调用（FastAPI 路由专用，不阻塞事件循环）；语义与同步版严格一致。
+
+    同样具备传输层瞬时故障自动重试（asyncio.sleep 退避，不阻塞事件循环）。
+    """
+    import asyncio  # 就近引入：仅异步路径需要事件循环级 sleep
     url = _endpoint_url()
     payload = _build_payload(messages, temperature=temperature, max_tokens=max_tokens)
-    logger.debug("LLM 异步请求 → %s (model=%s)", url, payload["model"])
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(url, json=payload, headers=_auth_headers())
-            resp.raise_for_status()
-            return _unwrap_response(resp.json())
-    except httpx.HTTPError as exc:
-        raise _wrap_http_error(exc) from exc
-    except ValueError as exc:
-        raise MetabolismError("LLM 响应不是合法 JSON", cause=exc) from exc
+    last_exc: Exception = MetabolismError("未执行")
+    for attempt in range(1, LLM_MAX_ATTEMPTS + 1):
+        try:
+            async with _async_safe_client(timeout) as client:
+                resp = await client.post(url, json=payload, headers=_auth_headers())
+                resp.raise_for_status()
+                return _unwrap_response(resp.json())
+        except httpx.HTTPError as exc:
+            last_exc = exc
+            if attempt < LLM_MAX_ATTEMPTS and _is_transient_error(exc):
+                logger.warning("LLM 传输层瞬时失败（第 %d/%d 次），退避后重试: %s",
+                               attempt, LLM_MAX_ATTEMPTS, exc)
+                await asyncio.sleep(LLM_RETRY_BACKOFF * attempt)
+                continue
+            raise _wrap_http_error(exc) from exc
+        except ValueError as exc:
+            raise MetabolismError("LLM 响应不是合法 JSON", cause=exc) from exc
+    raise _wrap_http_error(last_exc)  # 理论不可达，防御性兜底
 
 
 # ───────────────────────────────────────────────
