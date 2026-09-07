@@ -204,12 +204,21 @@ def _list_snapshots(kind: str) -> list:
 @router.get("/settings")
 def settings_page(request: Request):
     """渲染全能设置页（中间件已保证登录态）。"""
-    return _templates.TemplateResponse(request, "settings.html", {})
+    return _templates.TemplateResponse(request, "settings.html", {"active_nav": "settings"})
 
 
 @router.get("/settings/api")
 def settings_api():
-    """聚合返回当前全部配置（敏感键只回是否已配置，不回明文）。"""
+    """聚合返回当前全部配置（敏感键只回是否已配置，不回明文）。
+
+    Task 10.1: 附带 storage 存储诊断字段——配置文件实际落盘路径、
+    /data 挂载盘可写状态、env 密码接管状态。
+    背景：config.json 实际写入位置随运行环境漂移（/data 可写 → /data/config.json；
+    否则回退 /tmp/synapse_runtime/config.json），用户手工查看的文件若与实际
+    落盘位置不一致，会误判「保存不生效」。此字段让真相在设置页直接可见。
+    """
+    from storage import persistence as _persistence
+
     llm = config.get_llm()
     s3 = config.get_s3()
     return {
@@ -226,6 +235,12 @@ def settings_api():
             "has_secret": bool(s3.get("secret_access_key")),
         },
         "backup_policy": config.get_backup_policy(),
+        "storage": {
+            "config_path": str(config.config_path()),
+            "data_dir_writable": bool(_persistence.data_dir_writable),
+            "env_password_active": config.is_env_password_active(),
+            "env_password_var": config.WEB_PASSWORD_ENV,
+        },
     }
 
 
@@ -268,27 +283,34 @@ def api_set_llm(payload: dict):
     api_key = (payload.get("api_key") or "").strip()
     model = (payload.get("model") or "").strip()
     if base_url or api_key or model:
-        config.set_llm(base_url, api_key, model)
+        # Task 10.1: 尊重落盘结果——两个位置均写失败时必须让前端看到真实错误，
+        # 而非回 ok:true 造成「已保存」假象（正是用户误判配置不更新的帮凶之一）。
+        if not config.set_llm(base_url, api_key, model):
+            raise HTTPException(status_code=500, detail="配置写入失败（挂载盘与本地运行时目录均不可写），详见服务端日志")
     return {"ok": True}
 
 
 @router.post("/settings/api/s3")
 def api_set_s3(payload: dict):
-    config.set_s3(
+    # Task 10.1: 同上，落盘失败真实报错。
+    if not config.set_s3(
         (payload.get("endpoint_url") or "").strip(),
         (payload.get("access_key_id") or "").strip(),
         (payload.get("secret_access_key") or "").strip(),
         (payload.get("bucket") or "").strip(),
-    )
+    ):
+        raise HTTPException(status_code=500, detail="配置写入失败（挂载盘与本地运行时目录均不可写），详见服务端日志")
     return {"ok": True}
 
 
 @router.post("/settings/api/backup_policy")
 def api_set_backup_policy(payload: dict):
-    config.set_backup_policy(
+    # Task 10.1: 同上，落盘失败真实报错。
+    if not config.set_backup_policy(
         hourly_enabled=bool(payload.get("hourly_enabled")),
         daily_enabled=bool(payload.get("daily_enabled")),
-    )
+    ):
+        raise HTTPException(status_code=500, detail="配置写入失败（挂载盘与本地运行时目录均不可写），详见服务端日志")
     return {"ok": True}
 
 
@@ -349,8 +371,20 @@ _DEFAULT_BRAIN = "default"
 
 @router.get("/")
 def console_page(request: Request):
-    """渲染控制台主页（建点建边面板 + 待收纳列表宿主页）。"""
-    return _templates.TemplateResponse(request, "index.html", {})
+    """渲染图谱推演页（Task 11.6 多页重构：/ = 图谱推演 + Cytoscape 视口宿主）。"""
+    return _templates.TemplateResponse(request, "graph.html", {"active_nav": "graph"})
+
+
+@router.get("/workshop")
+def workshop_page(request: Request):
+    """渲染知识工坊页（Task 11.7：投喂 + 待提炼列表 + 待收纳池）。"""
+    return _templates.TemplateResponse(request, "workshop.html", {"active_nav": "workshop"})
+
+
+@router.get("/manual")
+def manual_page(request: Request):
+    """渲染手工编辑页（Task 11.8：建点 / 连线 / 规则断言 + 相近词弱提示）。"""
+    return _templates.TemplateResponse(request, "manual.html", {"active_nav": "manual"})
 
 
 @router.get("/api/concepts")
@@ -579,6 +613,116 @@ def api_reason(payload: dict):
 
 
 # ───────────────────────────────────────────────
+# 知识投喂与文档管理 API (Task 11.4)
+# ───────────────────────────────────────────────
+# 提炼流水线：POST /api/docs 入待提炼列表 → start 交后台引擎逐段提炼；
+# pause（→PAUSED，当前段完成后生效）/ cancel（→QUEUED，进度清零）/
+# delete（RUNNING 禁删）。txt 由前端 FileReader 读入后以 JSON 提交，
+# 免 multipart 依赖（FileReader 天然跨端，手机端同样可用）。
+
+_DOC_TEXT_MAX = 200_000   # 单文档正文字数上限（防超大粘贴拖垮分段与内存）
+
+
+def _doc_or_404(conn, doc_id: int) -> dict:
+    """取文档供状态前置判断；不存在统一 404（message 面向用户可读）。"""
+    from core import intake_store
+
+    doc = intake_store.get_doc(conn, doc_id)
+    if doc is None:
+        raise HTTPException(status_code=404, detail=f"文档不存在: doc={doc_id}")
+    return doc
+
+
+@router.get("/api/docs")
+def api_list_docs():
+    """待提炼列表（新→旧，含 progress 百分比）；busy=引擎当前任务（无则 null）。"""
+    from core.brain_manager import get_or_create
+    from core import distill_engine, intake_store
+
+    conn = get_or_create(_DEFAULT_BRAIN).get_sqlite()
+    items = intake_store.list_docs(conn)
+    return {"items": items, "busy": distill_engine.busy_doc()}
+
+
+@router.post("/api/docs")
+def api_create_doc(payload: dict):
+    """投喂知识文本：初始 QUEUED，等用户点「提炼」再入引擎。"""
+    from core.brain_manager import get_or_create
+    from core import intake_store
+
+    body = payload or {}
+    title = str(body.get("title", "")).strip()
+    text = str(body.get("text", "")).strip()
+    if not title:
+        raise HTTPException(status_code=422, detail="标题不得为空")
+    if not text:
+        raise HTTPException(status_code=422, detail="正文不得为空")
+    if len(text) > _DOC_TEXT_MAX:
+        raise HTTPException(status_code=422,
+                            detail=f"正文超长（>{_DOC_TEXT_MAX} 字），请拆分后分次投喂")
+
+    conn = get_or_create(_DEFAULT_BRAIN).get_sqlite()
+    doc_id = intake_store.create_doc(conn, title, text)
+    return {"ok": True, "doc": intake_store.get_doc(conn, doc_id)}
+
+
+@router.post("/api/docs/{doc_id}/start")
+def api_start_doc(doc_id: int):
+    """入队提炼：QUEUED/PAUSED/FAILED → RUNNING（忙碌互斥由引擎把关）。"""
+    from core.brain_manager import get_or_create
+    from core import distill_engine
+
+    _doc_or_404(get_or_create(_DEFAULT_BRAIN).get_sqlite(), doc_id)
+    try:
+        return distill_engine.start_doc(_DEFAULT_BRAIN, doc_id)
+    except distill_engine.DistillEngineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/api/docs/{doc_id}/pause")
+def api_pause_doc(doc_id: int):
+    """暂停：RUNNING → PAUSED（当前段完成后生效，进度保留）。"""
+    from core.brain_manager import get_or_create
+    from core import distill_engine
+
+    _doc_or_404(get_or_create(_DEFAULT_BRAIN).get_sqlite(), doc_id)
+    try:
+        return distill_engine.pause_doc(_DEFAULT_BRAIN, doc_id)
+    except distill_engine.DistillEngineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/api/docs/{doc_id}/cancel")
+def api_cancel_doc(doc_id: int):
+    """取消：RUNNING（当前任务）/PAUSED → QUEUED 且进度清零（按钮语义「变回提炼」）。"""
+    from core.brain_manager import get_or_create
+    from core import distill_engine
+
+    _doc_or_404(get_or_create(_DEFAULT_BRAIN).get_sqlite(), doc_id)
+    try:
+        return distill_engine.cancel_doc(_DEFAULT_BRAIN, doc_id)
+    except distill_engine.DistillEngineError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.delete("/api/docs/{doc_id}")
+def api_delete_doc(doc_id: int):
+    """删除文档（整行含原文）。RUNNING（含引擎当前任务）禁删 → 409。"""
+    from core.brain_manager import get_or_create
+    from core import distill_engine, intake_store
+
+    conn = get_or_create(_DEFAULT_BRAIN).get_sqlite()
+    doc = _doc_or_404(conn, doc_id)
+    if doc["status"] == intake_store.STATUS_RUNNING or \
+            distill_engine.is_current(_DEFAULT_BRAIN, doc_id):
+        raise HTTPException(status_code=409,
+                            detail="提炼运行中的文档禁止删除，请先暂停或取消")
+    if not intake_store.delete_doc(conn, doc_id):
+        raise HTTPException(status_code=404, detail=f"文档不存在: doc={doc_id}")
+    return {"ok": True}
+
+
+# ───────────────────────────────────────────────
 # 冒烟自检（python3 api/web_routes.py，零网络零真实密码）
 # ───────────────────────────────────────────────
 
@@ -615,12 +759,28 @@ if __name__ == "__main__":
 
     config.set_mode = _fake_set_mode
     config.get_llm = lambda: {"base_url": "", "api_key": "", "model": ""}
-    config.set_llm = lambda b, k, m: _captured.update(llm=(b, k, m))
+    # Task 10.3: 桩对齐真实 save_config 布尔语义（True=落盘成功）；
+    # _save_ok 可切换为 False 模拟「挂载盘+本地目录均写失败」→ 端点应真实 500。
+    _save_ok = {"ok": True}
+
+    def _fake_set_llm(b, k, m):
+        _captured["llm"] = (b, k, m)
+        return _save_ok["ok"]
+
+    def _fake_set_s3(e, a, s, b):
+        _captured["s3"] = (e, a, s, b)
+        return _save_ok["ok"]
+
+    def _fake_set_policy(hourly_enabled, daily_enabled):
+        _captured["policy"] = (hourly_enabled, daily_enabled)
+        return _save_ok["ok"]
+
+    config.set_llm = _fake_set_llm
     config.get_s3 = lambda: {"endpoint_url": "", "access_key_id": "",
                              "secret_access_key": "", "bucket": ""}
-    config.set_s3 = lambda e, a, s, b: _captured.update(s3=(e, a, s, b))
+    config.set_s3 = _fake_set_s3
     config.get_backup_policy = lambda: {"hourly_enabled": True, "daily_enabled": False}
-    config.set_backup_policy = lambda hourly_enabled, daily_enabled: _captured.update(policy=(hourly_enabled, daily_enabled))
+    config.set_backup_policy = _fake_set_policy
     config.is_s3_configured = lambda: False
     config.set_password = lambda p: True
     config.rotate_api_token = lambda: "sm_rotated_token"
@@ -690,10 +850,10 @@ if __name__ == "__main__":
         assert SESSION_COOKIE in set_cookie and "HttpOnly" in set_cookie, set_cookie
         print("正确密码 → 302 + HttpOnly Cookie ✓")
 
-        # 5) 携带合法 Cookie 访问管理页 → 200（真实 index.html 面板）
+        # 5) 携带合法 Cookie 访问管理页 → 200（真实 graph.html 图谱推演页）
         cookie = set_cookie.split(";", 1)[0]
         r = client.get("/", headers={"Cookie": cookie})
-        assert r.status_code == 200 and "Synapse" in r.text and "建立概念节点" in r.text, r.status_code
+        assert r.status_code == 200 and "Synapse" in r.text and "纯图推演" in r.text, r.status_code
         print("携带合法 Cookie 访问管理页 ✓")
 
         # 6) 篡改签名的 Cookie → 再次 302
@@ -732,7 +892,15 @@ if __name__ == "__main__":
         assert body["mode"] == "manual", body
         assert "api_key" not in body["llm"] and body["llm"]["has_key"] is False, body
         assert "secret_access_key" not in body["s3"] and body["s3"]["has_secret"] is False, body
-        print("设置聚合 API ✓")
+        # Task 10.3: storage 诊断字段——结构与取值（前端诊断条/横幅的数据源）
+        st = body["storage"]
+        assert set(st) == {"config_path", "data_dir_writable",
+                           "env_password_active", "env_password_var"}, st
+        assert st["config_path"].endswith("config.json"), st
+        assert isinstance(st["data_dir_writable"], bool), st
+        assert st["env_password_active"] is False, st      # 默认桩未接管
+        assert st["env_password_var"] == config.WEB_PASSWORD_ENV, st
+        print("设置聚合 API ✓（含 storage 诊断字段）")
 
         # 12) 模式切换：合法值写入 + 非法值 400
         r = client.post("/settings/api/mode", json={"mode": "augmented"}, **auth)
@@ -756,6 +924,29 @@ if __name__ == "__main__":
                                                          "daily_enabled": True}, **auth)
         assert _captured["policy"] == (False, True), _captured
         print("备份策略开关 ✓")
+
+        # 14b) Task 10.3: 落盘失败分支——桩切换为 False（模拟挂载盘+本地均不可写）→ 三端点真实 500
+        _save_ok["ok"] = False
+        for _path, _payload in (
+            ("/settings/api/llm", {"base_url": "http://x/v1", "api_key": "k", "model": "m"}),
+            ("/settings/api/s3", {"endpoint_url": "http://s3", "access_key_id": "a",
+                                   "secret_access_key": "s", "bucket": "b"}),
+            ("/settings/api/backup_policy", {"hourly_enabled": True, "daily_enabled": True}),
+        ):
+            r = client.post(_path, json=_payload, **auth)
+            assert r.status_code == 500 and "写入失败" in r.text, (_path, r.status_code, r.text[:120])
+        _save_ok["ok"] = True                    # 恢复成功桩，后续用例不受污染
+        r = client.post("/settings/api/backup_policy", json={"hourly_enabled": False,
+                                                             "daily_enabled": False}, **auth)
+        assert r.status_code == 200, r.status_code
+        print("配置落盘失败 → 500 真实报错 ✓（恢复后 200）")
+
+        # 14c) Task 10.3: env 密码接管状态透出——storage.env_password_active 随桩切换
+        config.is_env_password_active = lambda: True
+        r = client.get("/settings/api", **auth)
+        assert r.json()["storage"]["env_password_active"] is True, r.json()
+        config.is_env_password_active = lambda: False
+        print("storage.env_password_active 接管态透出 ✓")
 
         # 15) 密码修改：环境变量接管时 400（明示不生效）；解除接管后过短 400、正常 200
         config.is_env_password_active = lambda: True
