@@ -103,15 +103,35 @@ class BrainSession:
 
         kuzu.Database 指向不存在目录时会自动初始化空图；
         懒加载 import kuzu 使纯手工模式的冷启动不被 C++ 扩展拖慢。
+
+        Task 9.1（Milestone 9 修复）：建连成功后立即执行幂等 Schema 初始化。
+        空库若无 Concept/SYNAPSE 表，任何图谱查询都会 Binder exception（500）；
+        init_schema 先 SHOW TABLES 探测再建表，老库重复执行零副作用。
+        初始化失败时回滚并关闭句柄、复位 None，绝不缓存半初始化连接。
         """
         if self._kuzu_conn is None:
             with self._init_lock:
                 if self._kuzu_conn is None:  # 双重检查
                     import kuzu  # 延迟导入：仅真正用到图谱时加载
                     self._dir.mkdir(parents=True, exist_ok=True)
-                    self._kuzu_db = kuzu.Database(str(self._kuzu_dir))
-                    self._kuzu_conn = kuzu.Connection(self._kuzu_db)
-                    logger.info("Kùzu 实例就绪: brain=%s → %s", self.brain_id, self._kuzu_dir)
+                    db = kuzu.Database(str(self._kuzu_dir))
+                    conn = None
+                    try:
+                        conn = kuzu.Connection(db)
+                        from core.graph_cortex import init_schema  # 延迟导入，避免环依赖
+                        init_schema(conn)
+                        self._kuzu_db = db
+                        self._kuzu_conn = conn
+                        logger.info("Kùzu 实例就绪: brain=%s → %s", self.brain_id, self._kuzu_dir)
+                    except Exception:
+                        # 半初始化回滚：关闭句柄并保持 None，下次调用可重试
+                        try:
+                            if conn is not None:
+                                conn.close()
+                            db.close()
+                        except Exception:  # 关闭异常一并吞掉，保留原始异常向上抛
+                            pass
+                        raise
         return self._kuzu_conn
 
     @property
