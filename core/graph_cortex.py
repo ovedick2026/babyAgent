@@ -586,16 +586,18 @@ def list_synapses(
     if status and status not in SYNAPSE_STATUSES:
         raise ValueError(f"非法 status 过滤值: {status!r}，仅允许 {SYNAPSE_STATUSES}")
 
-    cypher = (
-        "MATCH (a:Concept)-[s:SYNAPSE]->(b:Concept)"
-        " RETURN s.rel_id, a.id, a.name, b.id, b.name,"
-        " s.relation, s.weight, s.evidence, s.status"
-    )
+    # Cypher 子句合法顺序：MATCH → WHERE → RETURN → ORDER BY → LIMIT。
+    # Task 9.2 修复：原实现把 WHERE 拼在 RETURN 之后，Kùzu Parser 直接报错。
+    cypher = "MATCH (a:Concept)-[s:SYNAPSE]->(b:Concept)"
     params: dict = {"lim": max(1, min(int(limit), 2000))}
     if status:
         cypher += " WHERE s.status = $st"
         params["st"] = status
-    cypher += " ORDER BY s.rel_id LIMIT $lim"
+    cypher += (
+        " RETURN s.rel_id, a.id, a.name, b.id, b.name,"
+        " s.relation, s.weight, s.evidence, s.status"
+        " ORDER BY s.rel_id LIMIT $lim"
+    )
 
     result = conn.execute(cypher, params)
     rows = []
