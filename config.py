@@ -216,14 +216,52 @@ def verify_password(plain_password: str, password_hash: Optional[str]) -> bool:
 
 
 def set_password(plain_password: str) -> bool:
-    """设置登录密码：bcrypt 哈希后写入 config.security.password_hash 并原子落盘。"""
+    """设置登录密码：bcrypt 哈希后写入 config.security.password_hash 并原子落盘。
+
+    注意：当环境变量密码接管生效时（is_env_password_active() 为 True），
+    本函数写入的哈希不会用于登录校验（env 优先），调用方（设置页守卫）应先拦截。"""
     cfg = load_config()
     cfg["security"]["password_hash"] = hash_password(plain_password)
     return save_config(cfg)
 
 
+# ───────────────────────────────────────────────
+# Web 登录密码环境变量接管 (Milestone 8)
+# ───────────────────────────────────────────────
+
+# 环境变量名：已设置且非空白串时，其明文优先于 config.json 的 password_hash，
+# 成为唯一有效的 Web 登录密码（容器/HF Spaces 部署免首次锁死的引导通道）。
+WEB_PASSWORD_ENV = "SYNAPSEMIND_WEB_PASSWORD"
+
+
+def get_env_password() -> Optional[str]:
+    """读取环境变量中的 Web 登录密码。
+
+    空白串（""、纯空格等）一律视为未设置，防止空密码把控制台彻底锁死；
+    未设置返回 None。"""
+    raw = os.environ.get(WEB_PASSWORD_ENV)
+    if raw is None or not raw.strip():
+        return None
+    return raw
+
+
+def is_env_password_active() -> bool:
+    """环境变量密码当前是否接管生效（供设置页改密守卫与诊断展示）。"""
+    return get_env_password() is not None
+
+
 def check_password(plain_password: str) -> bool:
-    """校验登录密码（读取配置中的 security.password_hash 比对）。"""
+    """校验登录密码（优先级：环境变量明文 > config.json bcrypt 哈希）。
+
+    - 环境变量已设置：恒时比较明文（hmac.compare_digest 防时序侧信道），
+      不再读取配置哈希——config 中旧密码在接管期间完全失效；
+    - 环境变量未设置：回落原 bcrypt 哈希比对逻辑（行为零变化）。"""
+    env_pwd = get_env_password()
+    if env_pwd is not None:
+        if not plain_password:
+            return False
+        return hmac.compare_digest(plain_password.encode("utf-8"),
+                                   env_pwd.encode("utf-8"))
     return verify_password(plain_password, load_config()["security"].get("password_hash"))
 
 
