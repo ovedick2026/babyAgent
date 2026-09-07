@@ -240,6 +240,14 @@ def api_set_mode(payload: dict):
 
 @router.post("/settings/api/password")
 def api_set_password(payload: dict):
+    # 环境变量密码接管期间，config 中哈希不参与登录校验，改密会被静默遮蔽——
+    # 明确拒绝并提示用户改用环境变量，避免「改了密码却不生效」的困惑。
+    if config.is_env_password_active():
+        raise HTTPException(
+            status_code=400,
+            detail=f"登录密码当前由环境变量 {config.WEB_PASSWORD_ENV} 接管，"
+                   f"设置页改密不生效；请更新该环境变量后重启服务",
+        )
     pwd = payload.get("password") or ""
     if len(pwd) < 6:
         raise HTTPException(status_code=400, detail="密码至少 6 位")
@@ -594,10 +602,11 @@ if __name__ == "__main__":
     # Task 6.1.2 自检补丁：config 读写函数全部打桩，写入值捕获进 _captured 供断言
     _cfg_names = ("get_mode", "set_mode", "get_llm", "set_llm", "get_s3", "set_s3",
                   "get_backup_policy", "set_backup_policy", "is_s3_configured",
-                  "set_password", "rotate_api_token")
+                  "set_password", "rotate_api_token", "is_env_password_active")
     _orig_cfg = {n: getattr(config, n) for n in _cfg_names}
     _captured: dict = {}
     config.get_mode = lambda: "manual"
+    config.is_env_password_active = lambda: False   # 默认未接管；Task 8.2 分支内可切换
 
     def _fake_set_mode(m):
         if m not in ("manual", "assisted", "augmented"):
@@ -748,12 +757,16 @@ if __name__ == "__main__":
         assert _captured["policy"] == (False, True), _captured
         print("备份策略开关 ✓")
 
-        # 15) 密码修改：过短 400，正常 200
+        # 15) 密码修改：环境变量接管时 400（明示不生效）；解除接管后过短 400、正常 200
+        config.is_env_password_active = lambda: True
+        r = client.post("/settings/api/password", json={"password": "abcdef"}, **auth)
+        assert r.status_code == 400 and "SYNAPSEMIND_WEB_PASSWORD" in r.text, (r.status_code, r.text[:160])
+        config.is_env_password_active = lambda: False
         r = client.post("/settings/api/password", json={"password": "123"}, **auth)
         assert r.status_code == 400, r.status_code
         r = client.post("/settings/api/password", json={"password": "abcdef"}, **auth)
         assert r.status_code == 200, r.status_code
-        print("密码修改校验 ✓")
+        print("密码修改校验 ✓（env 接管 400 / 解除后正常）")
 
         # 16) Token 轮换：仅本次响应回明文
         r = client.post("/settings/api/token", **auth)
