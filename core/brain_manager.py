@@ -57,11 +57,20 @@ class BrainSession:
         self._sqlite_path = self._dir / "brain.db"
         self._kuzu_dir = self._dir / "kuzu"
 
-        self._sqlite_conn: Optional[sqlite3.Connection] = None
         self._kuzu_db = None
         self._kuzu_conn = None
 
-        # 初始化互斥锁：并发首访时保证同脑连接单例，杜绝重复建连
+        # SQLite 线程本地连接：API 线程与提炼引擎线程各自独立建连。
+        # 依据：共享单连接时 FULLMUTEX 只保证单条 C 调用原子，
+        # 「autocommit 检查 → COMMIT」两步可被对方线程的事务插入交错，
+        # 双方 COMMIT 互相踩踏触发 cannot commit - no transaction is active；
+        # 线程本地化后事务序列天然隔离，写写碰撞由 busy_timeout + 短事务兜底。
+        self._sqlite_tls = threading.local()
+        # 全量登记（线程 id → 连接）：close() 统一回收，防句柄泄漏
+        self._sqlite_conns: dict[int, sqlite3.Connection] = {}
+        self._sqlite_lock = threading.Lock()
+
+        # 初始化互斥锁：并发首访时保证同脑 Kùzu 连接单例，杜绝重复建连
         self._init_lock = threading.Lock()
 
     # ───────────────────────────────────────────────
@@ -70,23 +79,32 @@ class BrainSession:
 
     def get_sqlite(self) -> sqlite3.Connection:
         """
-        获取本脑的 SQLite 连接（首次调用时建目录并建库）。
+        获取本线程专属的 SQLite 连接（每线程首次调用时建目录/建连）。
+
+        线程本地化依据：此前多线程共享单连接（check_same_thread=False），
+        但 FULLMUTEX 只保证单条 C 调用原子，「autocommit 检查 → COMMIT」
+        两步之间可被对方线程事务插入交错，导致
+        cannot commit - no transaction is active。线程本地连接使
+        事务序列天然隔离；跨线程写写碰撞由 busy_timeout(5s) + 短事务兜底。
 
         刻意保持默认回滚日志（journal_mode=DELETE）而非 WAL：
         WAL 会把最新写入滞留在 -wal 旁路文件中，而 Task 1.3.1 的快照
         只打包主库单文件，WAL 模式下可能拍到缺尾快照。默认模式下每次
         事务提交即完整落回 brain.db，快照永远一致。
         """
-        if self._sqlite_conn is None:
-            with self._init_lock:
-                if self._sqlite_conn is None:  # 双重检查：锁内二次确认
-                    self._dir.mkdir(parents=True, exist_ok=True)
-                    conn = sqlite3.connect(str(self._sqlite_path))
-                    conn.row_factory = sqlite3.Row          # 查询结果可按列名取值
-                    conn.execute("PRAGMA foreign_keys=ON;")  # 强制引用完整性
-                    self._sqlite_conn = conn
-                    logger.info("SQLite 连接就绪: brain=%s → %s", self.brain_id, self._sqlite_path)
-        return self._sqlite_conn
+        conn = getattr(self._sqlite_tls, "conn", None)
+        if conn is None:
+            self._dir.mkdir(parents=True, exist_ok=True)  # 幂等，线程安全
+            # 连接只在本线程使用，无需 check_same_thread=False
+            conn = sqlite3.connect(str(self._sqlite_path), timeout=5.0)
+            conn.row_factory = sqlite3.Row           # 查询结果可按列名取值
+            conn.execute("PRAGMA foreign_keys=ON;")  # 强制引用完整性
+            self._sqlite_tls.conn = conn
+            with self._sqlite_lock:
+                self._sqlite_conns[threading.get_ident()] = conn
+            logger.info("SQLite 连接就绪: brain=%s thread=%s → %s",
+                        self.brain_id, threading.get_ident(), self._sqlite_path)
+        return conn
 
     @property
     def sqlite_path(self) -> Optional[str]:
@@ -156,12 +174,16 @@ class BrainSession:
                 self._kuzu_conn = None
                 self._kuzu_db = None
 
-            if self._sqlite_conn is not None:
-                try:
-                    self._sqlite_conn.close()
-                except sqlite3.Error as exc:
-                    logger.warning("brain=%s SQLite 关闭异常（忽略）: %s", self.brain_id, exc)
-                self._sqlite_conn = None
+            # 回收全部线程本地连接（含已终止线程的残留句柄，防泄漏）
+            with self._sqlite_lock:
+                for tid, conn in self._sqlite_conns.items():
+                    try:
+                        conn.close()
+                    except sqlite3.Error as exc:
+                        logger.warning("brain=%s SQLite 关闭异常（忽略）: %s", self.brain_id, exc)
+                self._sqlite_conns.clear()
+            # 清空当前线程的 TLS 引用（若该线程后续再取连接会重建）
+            self._sqlite_tls.conn = None
 
             logger.info("brain=%s 会话句柄已全部释放", self.brain_id)
 
