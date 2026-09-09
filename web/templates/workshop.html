@@ -7,6 +7,26 @@
   /* 页面专属：状态徽章 / 文档行 / 进度条（Task 11.7，通用底座在 app.css） */
   .badge { display:inline-block; padding:1px 8px; font-size:11px; border-radius:999px; border:1px solid; }
   .badge.QUEUED  { color:#9fc0ff; border-color:#33477a; background:#131f3a; }
+  .badge.PENDING { color:#ffd28a; border-color:#5e4a33; background:#2a2130; }
+  .badge.KEPT    { color:#7fe3a0; border-color:#2f5e40; background:#12241a; }
+  .badge.VETOED  { color:#ff9b9b; border-color:#7a3347; background:#2a1218; }
+  .rev-row {
+    display:flex; gap:12px; align-items:flex-start;
+    background:#0d1425; border:1px solid #22304f; border-radius:10px;
+    padding:12px 14px; margin-bottom:10px;
+  }
+  .rev-main { flex:1; min-width:0; }
+  .rev-title { font-size:13px; color:#e8eefc; margin-bottom:6px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .rev-ev { font-size:11.5px; color:#8fa3c8; margin:4px 0; word-break:break-all; }
+  .rev-meta { font-size:11px; color:#5f729a; margin-top:4px; }
+  .rev-ops { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  .rev-ops button { padding:5px 12px; font-size:12px; }
+  .rev-ops button.danger { background:#3a1a24; border:1px solid #7a3347; }
+  @media (max-width:640px) {
+    .rev-row { flex-direction:column; }
+    .rev-ops { width:100%; }
+    .rev-ops button { flex:1; }
+  }
   .badge.RUNNING { color:#ffd28a; border-color:#5e4a33; background:#2a2130; }
   .badge.PAUSED  { color:#c9b3ff; border-color:#4a3a6e; background:#221a33; }
   .badge.DONE    { color:#7fe3a0; border-color:#2f5e40; background:#12241a; }
@@ -73,6 +93,9 @@
 <div class="card" id="pendingArea">
   <h2>③ 待收纳池（AI 提案 · 人工处置）</h2>
   <div class="actions" style="margin:0 0 12px">
+    <label style="margin:0;display:flex;align-items:center;gap:6px;cursor:pointer">
+      <input type="checkbox" id="pendSelAll" title="全选/取消全选当前页">全选本页
+    </label>
     <button class="ghost" id="btnPendReload" type="button">刷新列表</button>
     <button id="btnPendConfirm" type="button" disabled>✓ 批量确认选中</button>
     <button class="ghost" id="btnPendReject" type="button" disabled>✗ 批量拒绝选中</button>
@@ -80,7 +103,49 @@
     <span class="msg" id="msgP"></span>
   </div>
   <div id="pendList"></div>
+  <div class="actions" id="pendPager" style="margin-top:12px;display:none">
+    <button class="ghost" id="pendPrev" type="button">← 上一页</button>
+    <span class="selbar" id="pendPageInfo"></span>
+    <button class="ghost" id="pendNext" type="button">下一页 →</button>
+    <label style="margin-left:12px">每页
+      <select id="pendPageSize">
+        <option value="50" selected>50</option>
+        <option value="100">100</option>
+        <option value="200">200</option>
+      </select> 条
+    </label>
+  </div>
   <div class="empty" id="pendEmpty">当前没有待收纳提案（上方提炼产出的突触提案将出现在这里，由人工确认后方可参与推演）。</div>
+</div>
+
+<!-- ④ 复审队列（升级A·半自主收纳：高置信提案自动转正后按比例抽样，人工抽检兜底） -->
+<div class="card" id="reviewArea">
+  <h2>④ 复审队列（自动收纳抽检）</h2>
+  <div class="actions" style="margin:0 0 12px">
+    <label style="margin:0;display:flex;align-items:center;gap:8px;cursor:pointer">视图
+      <select id="revStatus" style="padding:4px 8px">
+        <option value="PENDING" selected>待复审</option>
+        <option value="KEPT">已维持</option>
+        <option value="VETOED">已否决</option>
+        <option value="">全部</option>
+      </select>
+    </label>
+    <label style="margin:0;display:flex;align-items:center;gap:6px;cursor:pointer">
+      <input type="checkbox" id="revSelAll" title="全选/取消全选当前页待复审项">全选本页
+    </label>
+    <button class="ghost" id="btnRevReload" type="button">刷新列表</button>
+    <button id="btnRevKeep" type="button" disabled>✓ 维持确认选中</button>
+    <button class="ghost" id="btnRevVeto" type="button" disabled>✗ 否决选中（回滚图谱）</button>
+    <span class="selbar" id="revSelInfo"></span>
+    <span class="msg" id="msgR"></span>
+  </div>
+  <div id="revList"></div>
+  <div class="actions" id="revPager" style="margin-top:12px;display:none">
+    <button class="ghost" id="revPrev" type="button">← 上一页</button>
+    <span class="selbar" id="revPageInfo"></span>
+    <button class="ghost" id="revNext" type="button">下一页 →</button>
+  </div>
+  <div class="empty" id="revEmpty">复审队列为空（高置信自动转正的提案按比例抽样入队，供人工抽检质量兜底）。</div>
 </div>
 {% endblock %}
 
@@ -89,6 +154,19 @@
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
   (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]));
+
+// 升级D 来源徽标：待收纳提案按 knowledge_source 渲染出身标记，
+// 审核者一眼分辨书籍/经验/手工/迁移，再落裁决（分级权限可视可查）。
+const KS_BADGES = {
+  "intake":   ["书籍", "tag-ks-book"],
+  "manual":   ["手工", "tag-ks-exp"],
+  "dialogue": ["对话", "tag-ks-exp"],
+  "legacy":   ["迁移", "tag-ks-book"],
+};
+function srcBadge(ks) {
+  const [label, cls] = KS_BADGES[ks] || [esc(ks || "未知"), "tag-ks-book"];
+  return ` <span class="tag ${cls}" title="知识来源：${esc(ks || "未知")}">${esc(label)}</span>`;
+}
 
 function setMsg(id, text, ok) {
   const el = $(id);
@@ -234,6 +312,8 @@ $("btnFeed").addEventListener("click", async (ev) => {
 // 铁律对齐：确认（→CONFIRMED）/ 拒绝（→REJECTED）/ 编辑 / 删除全部走后端
 // 状态机闸口；前端绝不伪造状态。
 let PENDING = [];
+let pendPage = 1;          // 当前页码（1 起）
+let pendPageSize = 50;     // 每页条数（50/100/200）
 
 function notifyGraphRefresh() {
   // 图视图就绪后暴露 window.refreshGraphView 即自动联动；工坊页无图视图时安全跳过
@@ -243,10 +323,21 @@ function notifyGraphRefresh() {
   window.dispatchEvent(new CustomEvent("synapses:changed"));
 }
 
-async function loadPending() {
+async function loadPending(keepPage = false) {
   const d = await api("/api/synapses?status=PENDING");
+  const prevSelected = new Set(pendSelectedIds());
   PENDING = d.items || [];
-  renderPending();
+  const maxPage = Math.max(1, Math.ceil(PENDING.length / pendPageSize));
+  if (!keepPage) {
+    // 数据变化（处置/删除后）时收敛页码，防止停留在越界空页
+    pendPage = Math.min(pendPage, maxPage);
+  }
+  renderPending(prevSelected);
+}
+
+function pendPageItems() {
+  const start = (pendPage - 1) * pendPageSize;
+  return PENDING.slice(start, start + pendPageSize);
 }
 
 function pendSelectedIds() {
@@ -259,18 +350,30 @@ function syncPendBar() {
   $("btnPendConfirm").disabled = n === 0;
   $("btnPendReject").disabled = n === 0;
   $("pendSelInfo").textContent = n ? `已选 ${n} / ${PENDING.length} 条` : "";
+  // 全选框三态：本页全选=勾选；部分选中=indeterminate；无选中=空
+  const pageCbs = [...document.querySelectorAll("#pendList input[type=checkbox]")];
+  const checked = pageCbs.filter((cb) => cb.checked).length;
+  const all = $("pendSelAll");
+  all.checked = pageCbs.length > 0 && checked === pageCbs.length;
+  all.indeterminate = checked > 0 && checked < pageCbs.length;
 }
 
-function renderPending() {
+function renderPending(keepSelected) {
+  const total = PENDING.length;
+  const maxPage = Math.max(1, Math.ceil(total / pendPageSize));
+  if (pendPage > maxPage) pendPage = maxPage;
+  const pageItems = pendPageItems();
+
   const list = $("pendList");
-  $("pendEmpty").hidden = PENDING.length > 0;
-  list.innerHTML = PENDING.map((s) => `
+  $("pendEmpty").hidden = total > 0;
+  list.innerHTML = pageItems.map((s) => `
     <div class="pend-row" data-rid="${esc(s.rel_id)}">
-      <input type="checkbox" value="${esc(s.rel_id)}" title="选中参与批量处置">
+      <input type="checkbox" value="${esc(s.rel_id)}" title="选中参与批量处置"
+             ${keepSelected && keepSelected.has(s.rel_id) ? "checked" : ""}>
       <div class="pend-main">
         <div class="pend-title">
           ${esc(s.src_name)}（${esc(s.src_id)}）<span class="arrow">→</span>${esc(s.dst_name)}（${esc(s.dst_id)}）
-          <span class="tag">提案</span>
+          <span class="tag">提案</span>${srcBadge(s.knowledge_source)}
         </div>
         ${s.evidence ? `<div class="pend-ev">证据：${esc(s.evidence)}</div>` : ""}
         <div class="pend-ops">
@@ -285,6 +388,15 @@ function renderPending() {
       </div>
     </div>
   `).join("");
+
+  // 分页条：单页数据时隐藏
+  const pager = $("pendPager");
+  pager.style.display = total > pendPageSize ? "flex" : "none";
+  $("pendPageInfo").textContent =
+    `第 ${pendPage} / ${maxPage} 页 · 共 ${total} 条（本页 ${pageItems.length} 条）`;
+  $("pendPrev").disabled = pendPage <= 1;
+  $("pendNext").disabled = pendPage >= maxPage;
+
   syncPendBar();
 }
 
@@ -368,11 +480,207 @@ $("btnPendReload").addEventListener("click", async () => {
   catch (e) { setMsg("msgP", "✗ " + e.message, false); }
 });
 
+// 全选/取消全选当前页（只影响本页复选框，跨页勾选互不干扰）
+$("pendSelAll").addEventListener("change", (ev) => {
+  const on = ev.target.checked;
+  document.querySelectorAll("#pendList input[type=checkbox]")
+    .forEach((cb) => { cb.checked = on; });
+  syncPendBar();
+});
+
+// 分页：翻页与每页条数切换（切页大小回落第 1 页，防越界空页）
+$("pendPrev").addEventListener("click", () => {
+  if (pendPage > 1) { pendPage -= 1; renderPending(); }
+});
+$("pendNext").addEventListener("click", () => {
+  const maxPage = Math.max(1, Math.ceil(PENDING.length / pendPageSize));
+  if (pendPage < maxPage) { pendPage += 1; renderPending(); }
+});
+$("pendPageSize").addEventListener("change", (ev) => {
+  pendPageSize = Number(ev.target.value) || 50;
+  pendPage = 1;
+  renderPending();
+});
+
+// ── ④ 复审队列（升级A·半自主收纳）：高置信自动转正抽样入队，人工抽检兜底 ──
+// KEPT=维持确认（图谱不动）；VETOED=否决（后端联动删除图谱侧突触）。
+// API 为服务端列表，此处 limit 拉全量后前端分页（抽样队列数据量天然很小）。
+let REVIEW = [];
+let revPage = 1;
+const REV_PAGE_SIZE = 50;
+
+async function loadReview(keepPage = false) {
+  const status = $("revStatus").value;
+  const d = await api(`/api/review?status=${encodeURIComponent(status)}&limit=10000`);
+  const prevSelected = new Set(revSelectedIds());
+  REVIEW = d.items || [];
+  const maxPage = Math.max(1, Math.ceil(REVIEW.length / REV_PAGE_SIZE));
+  if (!keepPage) revPage = Math.min(revPage, maxPage);
+  renderReview(prevSelected);
+}
+
+function revPageItems() {
+  const start = (revPage - 1) * REV_PAGE_SIZE;
+  return REVIEW.slice(start, start + REV_PAGE_SIZE);
+}
+
+function revSelectedIds() {
+  return [...document.querySelectorAll("#revList input[type=checkbox]:checked")]
+    .map((cb) => cb.value);
+}
+
+function syncRevBar() {
+  const n = revSelectedIds().length;
+  $("btnRevKeep").disabled = n === 0;
+  $("btnRevVeto").disabled = n === 0;
+  $("revSelInfo").textContent = n ? `已选 ${n} / ${REVIEW.length} 条` : "";
+  // 全选框三态（仅统计本页可勾选的待复审项）
+  const pageCbs = [...document.querySelectorAll("#revList input[type=checkbox]")];
+  const checked = pageCbs.filter((cb) => cb.checked).length;
+  const all = $("revSelAll");
+  all.checked = pageCbs.length > 0 && checked === pageCbs.length;
+  all.indeterminate = checked > 0 && checked < pageCbs.length;
+}
+
+const REV_LABEL = { PENDING: "待复审", KEPT: "已维持", VETOED: "已否决" };
+
+function renderReview(keepSelected) {
+  const total = REVIEW.length;
+  const maxPage = Math.max(1, Math.ceil(total / REV_PAGE_SIZE));
+  if (revPage > maxPage) revPage = maxPage;
+  const pageItems = revPageItems();
+
+  const list = $("revList");
+  $("revEmpty").hidden = total > 0;
+  list.innerHTML = pageItems.map((r) => {
+    const isPend = r.status === "PENDING";
+    return `
+    <div class="rev-row" data-rid="${esc(r.rel_id)}">
+      ${isPend ? `<input type="checkbox" value="${esc(r.rel_id)}" title="选中参与批量裁决"
+             ${keepSelected && keepSelected.has(r.rel_id) ? "checked" : ""}>` : ""}
+      <div class="rev-main">
+        <div class="rev-title">
+          ${esc(r.src_name)} <span class="arrow">→</span> ${esc(r.dst_name)}
+          <span class="tag">${esc(r.relation)}</span>
+          <span class="tag">w=${Number(r.weight).toFixed(2)}</span>
+          <span class="badge ${esc(r.status)}">${REV_LABEL[r.status] || esc(r.status)}</span>
+        </div>
+        ${r.evidence ? `<div class="rev-ev">证据：${esc(r.evidence)}</div>` : ""}
+        <div class="rev-meta">#${esc(r.rel_id)} · 入队 ${esc(r.enqueued_at)}${r.resolved_at ? ` · 裁决 ${esc(r.resolved_at)}` : ""}</div>
+      </div>
+      ${isPend ? `
+      <div class="rev-ops">
+        <button class="rKeep" type="button" title="认可自动收纳结果，图谱保持 CONFIRMED">✓ 维持</button>
+        <button class="ghost danger rVeto" type="button" title="撤销该自动收纳，后端联动删除图谱侧突触">✗ 否决</button>
+      </div>` : ""}
+    </div>`;
+  }).join("");
+
+  const pager = $("revPager");
+  pager.style.display = total > REV_PAGE_SIZE ? "flex" : "none";
+  $("revPageInfo").textContent =
+    `第 ${revPage} / ${maxPage} 页 · 共 ${total} 条（本页 ${pageItems.length} 条）`;
+  $("revPrev").disabled = revPage <= 1;
+  $("revNext").disabled = revPage >= maxPage;
+
+  syncRevBar();
+}
+
+$("revList").addEventListener("change", (ev) => {
+  if (ev.target.type === "checkbox") syncRevBar();
+});
+
+// 行内单条裁决（事件委托）：维持=盖章放行；否决=回滚图谱（confirm 二次确认）
+$("revList").addEventListener("click", async (ev) => {
+  const btn = ev.target.closest("button");
+  if (!btn) return;
+  const row = btn.closest(".rev-row");
+  const rid = row ? row.dataset.rid : null;
+  if (!rid) return;
+  const veto = btn.classList.contains("rVeto");
+  if (veto && !confirm(`否决将删除图谱侧突触 ${rid}（撤销自动收纳），确定？`)) return;
+  btn.disabled = true;
+  try {
+    await api("/api/review/batch", {
+      method: "POST",
+      body: { rel_ids: [rid], resolution: veto ? "VETOED" : "KEPT" },
+    });
+    setMsg("msgR", veto ? "✓ 已否决并回滚图谱" : "✓ 已维持确认", true);
+    await loadReview();
+    if (veto) notifyGraphRefresh();
+  } catch (e) {
+    setMsg("msgR", "✗ " + e.message, false);
+    btn.disabled = false;
+  }
+});
+
+async function revBatch(resolution) {
+  const ids = revSelectedIds();
+  if (!ids.length) return;
+  if (resolution === "VETOED" &&
+      !confirm(`否决将删除图谱侧 ${ids.length} 条突触（撤销自动收纳），确定？`)) return;
+  setMsg("msgR", `批量裁决 ${ids.length} 条中…`, true);
+  $("btnRevKeep").disabled = true;
+  $("btnRevVeto").disabled = true;
+  try {
+    const r = await api("/api/review/batch", {
+      method: "POST", body: { rel_ids: ids, resolution },
+    });
+    const fails = r.missing || [];
+    if (fails.length) {
+      setMsg("msgR", `✗ ${fails.length} 条裁决失败（不存在或已终审）：${fails.join("；")}`, false);
+    } else {
+      setMsg("msgR", `✓ 已${resolution === "KEPT" ? "维持确认" : "否决"} ${(r.succeeded || []).length} 条`, true);
+    }
+    await loadReview();
+    if (resolution === "VETOED" && !fails.length) notifyGraphRefresh();
+  } catch (e) {
+    setMsg("msgR", "✗ " + e.message, false);
+    syncRevBar();
+  }
+}
+
+$("btnRevKeep").addEventListener("click", () => revBatch("KEPT"));
+$("btnRevVeto").addEventListener("click", () => revBatch("VETOED"));
+$("btnRevReload").addEventListener("click", async () => {
+  try { await loadReview(); setMsg("msgR", "✓ 队列已刷新", true); }
+  catch (e) { setMsg("msgR", "✗ " + e.message, false); }
+});
+
+// 全选/取消全选当前页待复审项（终态行无复选框，天然不受影响）
+$("revSelAll").addEventListener("change", (ev) => {
+  const on = ev.target.checked;
+  document.querySelectorAll("#revList input[type=checkbox]")
+    .forEach((cb) => { cb.checked = on; });
+  syncRevBar();
+});
+
+// 视图切换（待复审/已维持/已否决/全部）：重置回第 1 页
+$("revStatus").addEventListener("change", () => {
+  revPage = 1;
+  loadReview().catch((e) => setMsg("msgR", "✗ " + e.message, false));
+});
+
+$("revPrev").addEventListener("click", () => {
+  if (revPage > 1) { revPage -= 1; renderReview(); }
+});
+$("revNext").addEventListener("click", () => {
+  const maxPage = Math.max(1, Math.ceil(REVIEW.length / REV_PAGE_SIZE));
+  if (revPage < maxPage) { revPage += 1; renderReview(); }
+});
+
 (async function boot() {
   try { await loadDocs(); }
   catch (e) { setMsg("msgD", "✗ " + e.message, false); }
   loadPending().catch((e) => setMsg("msgP", "✗ 待收纳列表加载失败：" + e.message, false));
-  setInterval(() => { loadDocs().catch(() => {}); }, 1500);
+  loadReview().catch((e) => setMsg("msgR", "✗ 复审队列加载失败：" + e.message, false));
+  // 待提炼列表 1.5s 轮询；待收纳池与复审队列同步轮询（keepPage 保留页码与勾选），
+  // 提炼产出的新提案 / 自动入队的新复审项自动浮现，无需手动刷新。
+  setInterval(() => {
+    loadDocs().catch(() => {});
+    loadPending(true).catch(() => {});
+    loadReview(true).catch(() => {});
+  }, 1500);
 })();
 </script>
 {% endblock %}

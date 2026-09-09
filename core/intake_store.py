@@ -218,6 +218,135 @@ def reset_running_to_paused(conn: sqlite3.Connection) -> int:
 
 
 # ───────────────────────────────────────────────
+# 抽样复审队列 (升级A)
+# ───────────────────────────────────────────────
+#
+# 自动收纳通道（intake.commit_proposals）把高置信提案直接转 CONFIRMED 后，
+# 按抽样比例挑出一部分登记到 auto_review 表，供人工抽检判定质量：
+#     PENDING  待复审（队列工作态）
+#     KEPT     维持确认（人工抽检认可，图谱不动）
+#     VETOED   否决（API 层联动回滚图谱侧突触，此处留审计痕迹）
+# 与 intake_docs 同库（brain.db），多脑隔离与 /data 镜像刷盘天然继承。
+
+REVIEW_PENDING = "PENDING"
+REVIEW_KEPT = "KEPT"
+REVIEW_VETOED = "VETOED"
+
+REVIEW_RESOLUTIONS = (REVIEW_KEPT, REVIEW_VETOED)
+
+
+def ensure_auto_review_table(conn: sqlite3.Connection) -> None:
+    """幂等创建 auto_review 表（rel_id 主键天然去重，重复入队静默忽略）。"""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auto_review (
+            rel_id      TEXT    PRIMARY KEY,
+            src_name    TEXT    NOT NULL,
+            dst_name    TEXT    NOT NULL,
+            relation    TEXT    NOT NULL,
+            weight      REAL    NOT NULL,
+            evidence    TEXT    NOT NULL DEFAULT '',
+            status      TEXT    NOT NULL DEFAULT 'PENDING'
+                        CHECK (status IN ('PENDING','KEPT','VETOED')),
+            enqueued_at TEXT    NOT NULL,
+            resolved_at TEXT
+        )
+        """
+    )
+    conn.commit()
+
+
+def enqueue_auto_review(conn: sqlite3.Connection, items: list[dict]) -> int:
+    """批量入队待复审提案快照（幂等：同 rel_id 二次入队不产生新行）。
+
+    Args:
+        items: [{rel_id, src_name, dst_name, relation, weight, evidence}, ...]
+               （intake 自动收纳后按抽样比例挑出的子集）
+
+    Returns:
+        本次实际新增行数（重复项不计）。
+    """
+    ensure_auto_review_table(conn)
+    now = _now_iso()
+    added = 0
+    for it in items:
+        rel_id = str(it.get("rel_id") or "").strip()
+        if not rel_id:
+            continue  # 无主键的残缺快照直接跳过（不因一格坏拖垮整批）
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO auto_review "
+            "(rel_id, src_name, dst_name, relation, weight, evidence, status, enqueued_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (rel_id, str(it.get("src_name") or ""), str(it.get("dst_name") or ""),
+             str(it.get("relation") or ""), float(it.get("weight") or 0.0),
+             str(it.get("evidence") or ""), REVIEW_PENDING, now),
+        )
+        added += cur.rowcount
+    conn.commit()
+    if added:
+        logger.info("auto_review: %d/%d 条入队待复审", added, len(items))
+    return added
+
+
+def list_auto_review(conn: sqlite3.Connection, status: Optional[str] = None,
+                     limit: int = 200, offset: int = 0) -> list[dict]:
+    """复审队列列表（新→旧）；status=None 返回全部，否则按状态过滤。"""
+    ensure_auto_review_table(conn)
+    if status is not None and status not in (REVIEW_PENDING, REVIEW_KEPT, REVIEW_VETOED):
+        raise ValueError(f"非法复审状态: {status!r}")
+    sql = ("SELECT rel_id, src_name, dst_name, relation, weight, evidence, "
+           "status, enqueued_at, resolved_at FROM auto_review")
+    params: list = []
+    if status is not None:
+        sql += " WHERE status = ?"
+        params.append(status)
+    sql += " ORDER BY enqueued_at DESC, rel_id DESC LIMIT ? OFFSET ?"
+    params += [int(limit), int(offset)]
+    return [dict(r) for r in conn.execute(sql, params).fetchall()]
+
+
+def count_auto_review(conn: sqlite3.Connection, status: Optional[str] = None) -> int:
+    """队列计数（供前端分页/角标；status=None 计全部）。"""
+    ensure_auto_review_table(conn)
+    if status is None:
+        row = conn.execute("SELECT COUNT(*) AS n FROM auto_review").fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM auto_review WHERE status = ?", (status,)
+        ).fetchone()
+    return int(row["n"])
+
+
+def resolve_auto_review(conn: sqlite3.Connection,
+                        rel_ids, resolution: str) -> dict:
+    """裁决复审项：KEPT=维持自动确认；VETOED=否决（图谱侧回滚由 API 层联动）。
+
+    仅 PENDING 可裁决（KEPT/VETOED 是终态，二次裁决进 missing 防误覆盖）。
+
+    Returns:
+        {"succeeded": [rel_id, ...], "missing": [rel_id, ...]}
+        missing = 不存在或已裁决的条目。
+    """
+    if resolution not in REVIEW_RESOLUTIONS:
+        raise ValueError(f"非法裁决: {resolution!r}（合法值: {REVIEW_RESOLUTIONS}）")
+    ensure_auto_review_table(conn)
+    ids = [rel_ids] if isinstance(rel_ids, str) else list(rel_ids)
+    now = _now_iso()
+    succeeded, missing = [], []
+    for rid in ids:
+        cur = conn.execute(
+            "UPDATE auto_review SET status=?, resolved_at=? "
+            "WHERE rel_id=? AND status=?",
+            (resolution, now, rid, REVIEW_PENDING),
+        )
+        (succeeded if cur.rowcount else missing).append(rid)
+    conn.commit()
+    if succeeded:
+        logger.info("auto_review: %d 条裁决为 %s", len(succeeded), resolution)
+    return {"succeeded": succeeded, "missing": missing}
+
+
+# ───────────────────────────────────────────────
 # 自检
 # ───────────────────────────────────────────────
 
@@ -269,4 +398,36 @@ if __name__ == "__main__":
     assert len(docs) == 1 and "raw_text" not in docs[0] and docs[0]["id"] == 1
     assert delete_doc(conn, 1) and list_docs(conn) == []
 
-    print("intake_store 自检通过 ✓ 状态机/进度/自愈/删除全部符合预期")
+    # ── 抽样复审队列 CRUD（升级A）──
+    assert enqueue_auto_review(conn, [
+        {"rel_id": "r1", "src_name": "恶寒", "dst_name": "表实证",
+         "relation": "提示", "weight": 0.95, "evidence": "《伤寒论》第1条"},
+        {"rel_id": "r2", "src_name": "咳嗽", "dst_name": "肺气不宣",
+         "relation": "导致", "weight": 0.9, "evidence": "肺气不宣则咳"},
+        {"rel_id": "", "src_name": "残缺"},   # 无主键残缺项静默跳过
+    ]) == 2
+    assert enqueue_auto_review(conn, [{"rel_id": "r1"}]) == 0, "重复入队应幂等忽略"
+    assert count_auto_review(conn) == 2 and count_auto_review(conn, REVIEW_PENDING) == 2
+    rows = list_auto_review(conn, REVIEW_PENDING)
+    assert rows[0]["rel_id"] == "r2" and rows[0]["status"] == REVIEW_PENDING, "新→旧排序"
+
+    res = resolve_auto_review(conn, ["r1"], REVIEW_KEPT)
+    assert res["succeeded"] == ["r1"] and res["missing"] == []
+    res = resolve_auto_review(conn, ["r1", "r2"], REVIEW_VETOED)
+    assert res["succeeded"] == ["r2"] and "r1" in res["missing"], "终态二次裁决进 missing"
+    kept = list_auto_review(conn, REVIEW_KEPT)
+    vetoed = list_auto_review(conn, REVIEW_VETOED)
+    assert len(kept) == 1 and kept[0]["resolved_at"] and len(vetoed) == 1
+
+    try:
+        resolve_auto_review(conn, "r1", "DELETED")
+        raise AssertionError("非法裁决应被拒绝")
+    except ValueError:
+        pass
+    try:
+        list_auto_review(conn, "BAD")
+        raise AssertionError("非法状态过滤应被拒绝")
+    except ValueError:
+        pass
+
+    print("intake_store 自检通过 ✓ 状态机/进度/自愈/删除/复审队列全部符合预期")

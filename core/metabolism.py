@@ -252,9 +252,10 @@ _SKIM_SYSTEM_PROMPT = (
     "输出突触提案 JSON 数组。规则：\n"
     "1. 仅输出 JSON 数组本身，禁止任何解释文字、前言或 markdown 代码块标记。\n"
     '2. 数组每项形如 {"source": "概念A", "target": "概念B", '
-    '"relation": "causes", "weight": 0.8, "evidence": "原文依据片段"}。\n'
-    "3. source/target 取原文关键概念短语（≤32 字）；relation 用简短英文标签"
-    "（如 causes/inhibits/suggests/part_of）；weight 为 0~1 小数表示关系确定度；"
+    '"relation": "导致", "weight": 0.8, "evidence": "原文依据片段"}。\n'
+    "3. source/target/relation 一律使用中文：source/target 取原文关键概念短语"
+    "（≤32 字）；relation 用简短中文关系词（如 导致/抑制/提示/属于/主治/表现为/"
+    "包含/依赖，优先沿用原文措辞）；weight 为 0~1 小数表示关系确定度；"
     "evidence 为支撑该关系的原文片段（≤100 字，可为空字符串）。\n"
     "4. 严禁提出概念合并、改名、删除等任何修改既有图谱的建议。\n"
     "5. 资料中无任何可抽取关系时输出 []。"
@@ -373,6 +374,64 @@ async def askim_extract_proposals(text: str, *, timeout: float = DEFAULT_TIMEOUT
     return _parse_skim_raw(raw)
 
 
+# ───────────────────────────────────────────────
+# 对话回流秘书：用户话语 → 突触提案 (升级C)
+# ───────────────────────────────────────────────
+
+_REFLECT_SYSTEM_PROMPT = (
+    "你是知识图谱的「对话回流秘书」。用户刚与推演助手完成一轮对话，"
+    "你的任务是从用户话语中识别「新增知识」或「纠正既有结论」的陈述，"
+    "输出突触提案 JSON 数组供人工审核入库。规则：\n"
+    "1. 仅输出 JSON 数组本身，禁止任何解释文字、前言或 markdown 代码块标记。\n"
+    '2. 数组每项形如 {"source": "概念A", "target": "概念B", '
+    '"relation": "导致", "weight": 0.8, "evidence": "用户原话片段"}。\n'
+    "3. source/target/relation 一律使用中文：source/target 取用户话语中的关键"
+    "概念短语（≤32 字）；relation 用简短中文关系词（如 导致/抑制/提示/属于/主治/"
+    "表现为/包含/依赖，优先沿用用户措辞）；weight 为 0~1 小数表示表述确定度；"
+    "evidence 必须摘录用户原话片段（≤100 字），保留口语原貌供审核者溯源。\n"
+    "4. 仅抽取陈述性知识（经验、事实、纠正意见）；纯提问、闲聊、确认性应答"
+    "（如「好的」「明白了」）一律忽略，无知识可抽时输出 []。\n"
+    "5. 严禁提出概念合并、改名、删除等任何修改既有图谱的建议；用户对既有结论的"
+    "否定（如「不对，A 不是 B 的病因」）应输出为修正方向的关系提案，"
+    "新旧冲突的裁决权完全归人工审核。"
+)
+
+
+def _reflect_messages(clue: str, answer: str = "") -> List[Dict[str, str]]:
+    """构造对话回流秘书消息序列（system 规则 + 话语/语境定界包裹）。
+
+    answer 仅作纠正语境参考（用户说「不对」时秘书需知道在否定什么），
+    prompt 层已明令绝不从 answer 中抽取 —— 回流只沉淀用户亲口所言。
+    """
+    user_content = f"用户话语：\n<<<\n{clue.strip()}\n>>>"
+    if answer and answer.strip():
+        user_content += (
+            "\n\n（供参考的助手上一轮回答，仅作语境，绝不从中抽取）：\n<<<\n"
+            + answer.strip()[:2000] + "\n>>>")
+    return [
+        {"role": "system", "content": _REFLECT_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def reflect_extract_proposals(clue: str, answer: str = "", *,
+                              timeout: float = DEFAULT_TIMEOUT) -> dict:
+    """同步版对话回流秘书（脚本/自检用）：返回 {proposals, raw, dropped}。"""
+    if not clue or not clue.strip():
+        raise MetabolismError("对话回流解析的用户话语为空")
+    raw = chat_completion(_reflect_messages(clue, answer), timeout=timeout)
+    return _parse_skim_raw(raw)
+
+
+async def areflect_extract_proposals(clue: str, answer: str = "", *,
+                                     timeout: float = DEFAULT_TIMEOUT) -> dict:
+    """异步版对话回流秘书（FastAPI 路由用）；行为与同步版严格一致。"""
+    if not clue or not clue.strip():
+        raise MetabolismError("对话回流解析的用户话语为空")
+    raw = await achat_completion(_reflect_messages(clue, answer), timeout=timeout)
+    return _parse_skim_raw(raw)
+
+
 if __name__ == "__main__":
     # 冒烟自检（零网络）：
     # 1) 配置预检与错误包装路径
@@ -395,13 +454,13 @@ if __name__ == "__main__":
         return (
             "好的，以下是提取结果：\n"
             "```json\n"
-            "[{\"source\":\"风寒\",\"target\":\"恶寒\",\"relation\":\"causes\","
+            "[{\"source\":\"风寒\",\"target\":\"恶寒\",\"relation\":\"导致\","
             "\"weight\":0.9,\"evidence\":\"风寒束表则恶寒\"},"
-            "{\"source\":\"风寒\",\"target\":\"发热\",\"relation\":\"causes\","
+            "{\"source\":\"风寒\",\"target\":\"发热\",\"relation\":\"导致\","
             "\"weight\":1.5,\"evidence\":\"郁而发热\"},"
-            "{\"source\":\"\",\"target\":\"空源头\",\"relation\":\"causes\","
+            "{\"source\":\"\",\"target\":\"空源头\",\"relation\":\"导致\","
             "\"weight\":0.5,\"evidence\":\"\"},"
-            "{\"source\":\"恶寒\",\"target\":\"发热\",\"relation\":\"causes\","
+            "{\"source\":\"恶寒\",\"target\":\"发热\",\"relation\":\"并见\","
             "\"weight\":0.7,\"evidence\":\"二症并见\",\"confidence\":0.99,"
             "\"merge\":\"建议合并恶寒与发热\"}]\n"
             "```"
@@ -422,3 +481,41 @@ if __name__ == "__main__":
         skim_extract_proposals("测试资料")
     except MetabolismError as exc:
         print("解析失败包装（预期）:", str(exc)[:60])
+
+    # 4) 升级C 对话回流秘书：monkeypatch 喂典型话语
+    #    修正性话语 → 提取纠正提案；纯闲聊 → 零提案；越权字段剔除。
+    def _fake_reflect(messages, **kw):
+        assert "用户话语" in messages[1]["content"], "user 消息应含话语定界包裹"
+        if "明白" in messages[1]["content"]:
+            return "[]"
+        return (
+            "```json\n"
+            "[{\"source\":\"桂枝\",\"target\":\"风寒表虚证\",\"relation\":\"主治\","
+            "\"weight\":0.8,\"evidence\":\"我临床上桂枝治这个很管用\"},"
+            "{\"source\":\"麻黄\",\"target\":\"表虚证\",\"relation\":\"主治\","
+            "\"weight\":0.9,\"evidence\":\"麻黄也行\",\"confidence\":0.99,"
+            "\"merge\":\"建议合并麻黄桂枝\"}]\n"
+            "```"
+        )
+
+    _self.chat_completion = _fake_reflect
+    refl = reflect_extract_proposals("不对，应该是桂枝主治风寒表虚证，我临床上用着很管用。",
+                                     answer="（参考语境）麻黄主治表实证……")
+    assert len(refl["proposals"]) == 2 and refl["dropped"] == 0, refl
+    assert refl["proposals"][1]["weight"] == 0.9, "越界 weight 应 clamp"
+    assert all(set(p) == set(PROPOSAL_KEYS) for p in refl["proposals"]), \
+        "越权字段（merge/confidence）必须被剔除"
+    chatter = reflect_extract_proposals("好的，明白了，谢谢")
+    assert chatter["proposals"] == [], "纯闲聊应零提案"
+
+    try:
+        reflect_extract_proposals("   ")
+        raise AssertionError("空话语应被拦截")
+    except MetabolismError:
+        pass
+
+    # 5) 回流消息构造：answer 语境携带 + 空 answer 不携带
+    assert "参考" in _reflect_messages("问", answer="答")[1]["content"]
+    assert "参考" not in _reflect_messages("问")[1]["content"]
+
+    print("metabolism 冒烟自检全部通过 ✓（含升级C 对话回流秘书）")

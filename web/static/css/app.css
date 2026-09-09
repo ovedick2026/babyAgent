@@ -107,6 +107,10 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   font-size: 11px; color: #ffd28a; background: #2a2130;
   border: 1px solid #5e4a33; border-radius: 999px;
 }
+/* 升级D 来源徽标：书籍/迁移=暖金（权威禁改，对话不可碰）；
+   手工/对话=蓝（经验类，可经对话纠正，人工终审落定）。 */
+.pend-title .tag.tag-ks-book { color: #ffd28a; background: #2a2130; border-color: #5e4a33; }
+.pend-title .tag.tag-ks-exp { color: #9fc0ff; background: #16233c; border-color: #2f4a7a; }
 .pend-ev { font-size: 11px; color: #8fa3c8; margin-bottom: 8px; word-break: break-all; }
 .pend-ops { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .pend-ops input[type="range"] { width: 140px; }

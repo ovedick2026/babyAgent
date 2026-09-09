@@ -48,26 +48,36 @@ def _brain_sqlite_candidates(brain_id: str):
 
 
 def _brain_kuzu_candidates(brain_id: str):
-    """按优先级给出该 brain 的 Kùzu 图目录可能路径。"""
-    yield RUNTIME_DIR / brain_id / "kuzu"          # 多脑目录布局
+    """按优先级给出该 brain 的 Kùzu 图库可能路径（文件或目录均可）。"""
+    yield RUNTIME_DIR / brain_id / "kuzu"          # 多脑布局：Kùzu ≥0.11 为单文件，旧版为目录
     yield KUZU_RUNTIME_DIR / brain_id              # 扁平布局：每脑一图
 
 
 def _locate_brain_sources(brain_id: str) -> Tuple[Optional[Path], Optional[Path]]:
-    """定位 brain 的 SQLite 库与 Kùzu 目录，返回 (sqlite_path|None, kuzu_dir|None)。"""
+    """
+    定位 brain 的 SQLite 库与 Kùzu 图库，返回 (sqlite_path|None, kuzu_store|None)。
+
+    BugFix：Kùzu ≥0.11 将图库落为【单文件】（{brain_id}/kuzu 无扩展名文件），
+    此前仅接受目录形态 —— is_dir() 判定永远落空，快照会静默丢掉整张图
+    （正是「手动备份显示上传成功、云端却无可用数据」的打包侧根因）。
+    现两种形态均接受：文件非空 / 目录非空即纳入打包。
+    """
     sqlite_path: Optional[Path] = None
     for cand in _brain_sqlite_candidates(brain_id):
         if cand.is_file():
             sqlite_path = cand
             break
 
-    kuzu_dir: Optional[Path] = None
+    kuzu_store: Optional[Path] = None
     for cand in _brain_kuzu_candidates(brain_id):
+        if cand.is_file() and cand.stat().st_size > 0:
+            kuzu_store = cand
+            break
         if cand.is_dir() and any(cand.iterdir()):
-            kuzu_dir = cand
+            kuzu_store = cand
             break
 
-    return sqlite_path, kuzu_dir
+    return sqlite_path, kuzu_store
 
 
 def pack_snapshot(brain_id: str) -> Optional[Path]:
@@ -108,7 +118,16 @@ def pack_snapshot(brain_id: str) -> Optional[Path]:
                 logger.info("快照纳入 SQLite 库: %s", sqlite_path)
             if kuzu_dir is not None:
                 tar.add(kuzu_dir, arcname=f"kuzu/{kuzu_dir.name}")
-                logger.info("快照纳入 Kùzu 目录: %s", kuzu_dir)
+                logger.info("快照纳入 Kùzu 图库: %s", kuzu_dir)
+                # 单文件形态（Kùzu ≥0.11）WAL 兜底：checkpoint 未刷净的事务
+                # 滞留在旁路 kuzu.wal，主文件可能是空壳 —— 不一并打包，
+                # 快照恢复后必残缺（与 persistence 刷盘侧 WAL 镜像对称）。
+                # 目录形态的 WAL 在图目录内部，tar.add 已天然覆盖。
+                if kuzu_dir.is_file():
+                    wal_path = kuzu_dir.parent / (kuzu_dir.name + ".wal")
+                    if wal_path.is_file() and wal_path.stat().st_size > 0:
+                        tar.add(wal_path, arcname=f"kuzu/{wal_path.name}")
+                        logger.info("快照纳入 Kùzu WAL: %s", wal_path)
 
         size_kb = snapshot_path.stat().st_size / 1024
         logger.info("快照打包完成: %s (%.1f KB)", snapshot_path.name, size_kb)
@@ -469,20 +488,50 @@ def _writeback_sqlite(tar: tarfile.TarFile, members: list, dst_root: Path) -> in
 
 def _writeback_kuzu(tar: tarfile.TarFile, members: list, dst_root: Path) -> None:
     """
-    将归档中 kuzu/<图目录> 成员原子写回 dst_root 下的对应子图目录。
-    与 persistence.sync_kuzu 同款三步换入：失败回滚旧镜像，绝不留半恢复状态。
+    将归档中 kuzu/<图库> 成员原子写回 dst_root 下的对应位置。
+
+    形态自适应（与打包侧对称）：
+      - 单文件形态（Kùzu ≥0.11）：归档成员为 kuzu/kuzu 单文件，
+        走同分区临时文件 + os.replace 原子换入；
+      - 目录形态（旧版 Kùzu）：归档成员为 kuzu/{brain_id}/... 目录树，
+        走三步换入（staging → 旧镜像改名回滚位 → rename），失败回滚。
     """
     kuzu_members = [m for m in members if m.name.startswith("kuzu/")]
     if not kuzu_members:
         return
 
+    dst_root.mkdir(parents=True, exist_ok=True)
+    final = dst_root / "kuzu"
+
+    # ── 单文件形态：归档内全部为 kuzu/kuzu 一级文件成员 ──
+    single_file = next(
+        (m for m in kuzu_members if m.isfile() and Path(m.name).parent == Path("kuzu")),
+        None,
+    )
+    if single_file is not None and all(m.isfile() for m in kuzu_members):
+        # 主文件 + WAL 等全部一级成员逐一原子换入（与打包侧 WAL 纳入对称）：
+        # 快照含 kuzu.wal 时必须一并还原，否则 checkpoint 未刷净的事务丢失；
+        # 归档无 WAL 成员则清掉目标旧 WAL，防止陈旧 WAL 被 replay 到新主文件上。
+        has_wal_member = False
+        for m in kuzu_members:
+            member_name = Path(m.name).name  # kuzu/kuzu → kuzu；kuzu/kuzu.wal → kuzu.wal
+            if member_name.endswith(".wal"):
+                has_wal_member = True
+            tmp_dst = dst_root / f".{member_name}.restore_tmp"
+            with tar.extractfile(m) as src, open(tmp_dst, "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            os.replace(tmp_dst, dst_root / member_name)
+            logger.info("Kùzu 单文件成员已恢复: %s", dst_root / member_name)
+        if not has_wal_member:
+            (dst_root / "kuzu.wal").unlink(missing_ok=True)
+        return
+
+    # ── 目录形态：归档内为 kuzu/{graph_dir}/... 目录树 ──
     # 归档内顶层图目录名（kuzu/{brain_id}/... 中的 brain_id 段）
     graph_dir = kuzu_members[0].name.split("/")[1]
     if not graph_dir:
         raise tarfile.TarError("无法确定归档内的图目录名")
 
-    dst_root.mkdir(parents=True, exist_ok=True)
-    final = dst_root / graph_dir
     # 暂存与回滚目录均置于 dst_root 同分区，保证 rename 原子性
     staging = dst_root.parent / f".{dst_root.name}.{graph_dir}.restore_staging"
     rollback = dst_root.parent / f".{dst_root.name}.{graph_dir}.restore_old"
@@ -499,13 +548,15 @@ def _writeback_kuzu(tar: tarfile.TarFile, members: list, dst_root: Path) -> None
             with tar.extractfile(m) as src, open(target, "wb") as dst:
                 shutil.copyfileobj(src, dst)
 
-        # 三步换入（同分区 rename 保证原子性）
+        # 三步换入（同分区 rename 保证原子性）；旧镜像若为单文件形态，直接清除
         shutil.rmtree(rollback, ignore_errors=True)
-        if final.exists():
+        if final.is_dir():
             os.rename(final, rollback)
+        elif final.exists():
+            final.unlink()
         os.rename(staging, final)
         shutil.rmtree(rollback, ignore_errors=True)
-        logger.info("Kùzu 镜像已恢复: %s", final)
+        logger.info("Kùzu 目录镜像已恢复: %s", final)
     except (OSError, shutil.Error):
         shutil.rmtree(staging, ignore_errors=True)
         if not final.exists() and rollback.exists():
@@ -516,30 +567,51 @@ def _writeback_kuzu(tar: tarfile.TarFile, members: list, dst_root: Path) -> None
 
 def restore_from_cloud(brain_id: str, kind: str, s3_cfg) -> bool:
     """
-    Task 1.3.5b: 一键云端恢复。
+    Task 1.3.5b: 一键云端恢复（BugFix：目标布局对齐多脑镜像）。
+
+    此前恢复写回用的是多脑改造前的旧扁平常量（DATA_DIR/sqlite 与 DATA_DIR/kuzu），
+    与真实镜像布局 {DATA_DIR}/brains/{brain_id}/ 完全错位；且归档内
+    kuzu/{brain_id}/... 被恢复到顶层 kuzu/ 后永远回不到 {brain_id}/ 工作位，
+    等于恢复必废。现已对齐：
 
     流程：
-      1. 下载 kind（manual/hourly/daily）前缀下指定的最新一份归档；
-      2. 校验归档完整性与路径安全（先校验后落盘，绝不部分写盘）；
-      3. 原子覆盖 /data 镜像（挂载盘不可用时直接写运行时目录）；
-      4. 挂载盘可用时触发 restore_on_boot() 把镜像自愈拉回 /tmp 工作副本；
+      1. 先 close_brain 关闭该脑全部活句柄（防止活连接继续读写被替换的文件）；
+      2. 下载 kind（manual/hourly/daily）前缀下指定的最新一份归档；
+      3. 校验归档完整性与路径安全（先校验后落盘，绝不部分写盘）；
+      4. 原子覆盖 /data 多脑镜像（挂载盘不可用时直接写运行时工作位）；
+      5. 挂载盘可用时触发 restore_on_boot(brain_id) 把镜像自愈拉回 /tmp 工作副本；
          仅本地模式下 /tmp 已直接写好，不再触发拉取（避免被 /data 旧镜像覆盖）。
-
-    注意：应在该 brain 会话尚未打开库连接时调用（Task 2.2.x 落地后需
-    先 close_brain 再恢复，防止活句柄读写被替换的文件）。
 
     Returns:
         True=恢复成功；False=云端无归档 / 校验或写回失败。
     """
     _validate_kind(kind)
+
+    # 1) 关闭该脑活句柄：会话若被打开，Kùzu/SQLite 会继续持有旧文件 inode，
+    #    恢复写回后立即被活连接的旧缓冲覆盖，等于白恢复。
+    try:
+        from core import brain_manager
+
+        brain_manager.close_brain(brain_id)
+        logger.info("恢复前已安全释放 brain=%s 的全部句柄", brain_id)
+    except Exception as exc:  # noqa: BLE001 关闭失败不阻断恢复（脑可能本就未加载）
+        logger.info("恢复前关闭 brain=%s 会话跳过（可能未加载）: %s", brain_id, exc)
+
     local_path = download_snapshot(brain_id, kind, s3_cfg)
     if local_path is None:
         logger.info("云端无可用归档，恢复中止: brain=%s kind=%s", brain_id, kind)
         return False
 
+    # 目标布局与 persistence 多脑镜像严格 1:1：
+    #   {DATA_DIR}/brains/{brain_id}/brain.db + {DATA_DIR}/brains/{brain_id}/kuzu/
+    # 仅本地模式则直接写运行时工作位 {RUNTIME_DIR}/{brain_id}/。
     writable = _persistence.data_dir_writable
-    sqlite_dst = _persistence.SQLITE_DATA_DIR if writable else _persistence.SQLITE_RUNTIME_DIR
-    kuzu_dst = _persistence.KUZU_DATA_DIR if writable else _persistence.KUZU_RUNTIME_DIR
+    if writable:
+        brain_root = _persistence.BRAINS_DATA_DIR / brain_id
+    else:
+        brain_root = _persistence.RUNTIME_DIR / brain_id
+    sqlite_dst = brain_root
+    kuzu_dst = brain_root
 
     try:
         with tarfile.open(local_path, "r:gz") as tar:
@@ -548,7 +620,7 @@ def restore_from_cloud(brain_id: str, kind: str, s3_cfg) -> bool:
             _writeback_kuzu(tar, members, kuzu_dst)
 
         if writable:
-            _persistence.restore_on_boot()
+            _persistence.restore_on_boot(brain_id)
             logger.info("云端恢复完成并已触发自愈拉取: brain=%s kind=%s", brain_id, kind)
         else:
             logger.warning(

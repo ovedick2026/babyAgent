@@ -99,9 +99,13 @@ def _reason_on_subgraph(
     min_peak: float = DEFAULT_MIN_PEAK,
     min_fanin: int = DEFAULT_MIN_FANIN,
     top_k: int = DEFAULT_TOP_K,
+    extra_seeds: Optional[Dict[str, float]] = None,
 ) -> dict:
     """
     纯函数推演核心：在给定 CONFIRMED 子图上完成完整闭环。
+
+    extra_seeds（升级B 增量扩散）：上一轮高能节点经衰减后的增量种子
+    {concept_id: weight}，与本轮线索定位种子合并后统一重扩散。
 
     与 Kùzu / brain_manager 完全解耦，离线单测只需构造 subgraph dict。
 
@@ -126,6 +130,20 @@ def _reason_on_subgraph(
     """
     clue = (clue or "").strip()
     seeds = locate_seeds(subgraph, clue)
+
+    # 升级B 增量扩散：extra_seeds（上轮高能节点经衰减后的增量种子）并入
+    # 本轮线索定位种子；同节点冲突取较大权重，非法/越界条目直接丢弃。
+    # 并入发生在 insufficient 判定之前——纯追问（线索不命中概念）也能
+    # 依靠上轮余温继续扩散（「还有呢」语义）。
+    if extra_seeds:
+        for cid, w in extra_seeds.items():
+            try:
+                w = float(w)
+            except (TypeError, ValueError):
+                continue
+            if 0.0 < w <= 1.0:
+                seeds[cid] = max(seeds.get(cid, 0.0), w)
+
     if not seeds:
         return {
             "status": "insufficient",
@@ -296,9 +314,13 @@ def pure_reason(
     min_peak: float = DEFAULT_MIN_PEAK,
     min_fanin: int = DEFAULT_MIN_FANIN,
     top_k: int = DEFAULT_TOP_K,
+    extra_seeds: Optional[Dict[str, float]] = None,
 ) -> dict:
     """
     brain_id 入口薄封装：拉取该脑 CONFIRMED 子图后执行纯函数推演核心。
+
+    extra_seeds（升级B 增量扩散）：透传至推演核心，供多轮对话将
+    上轮高能节点衰减后并入本轮种子。
 
     供上层路由（模式 1 API / OpenAI 兼容端点的 manual 分支）直接调用；
     任何 Kùzu 异常向上抛出，由调用方决定 5xx 语义，本层不吞错。
@@ -307,7 +329,8 @@ def pure_reason(
 
     subgraph = get_brain_confirmed_subgraph(brain_id)
     return _reason_on_subgraph(
-        subgraph, clue, min_peak=min_peak, min_fanin=min_fanin, top_k=top_k
+        subgraph, clue, min_peak=min_peak, min_fanin=min_fanin, top_k=top_k,
+        extra_seeds=extra_seeds,
     )
 
 
@@ -335,3 +358,22 @@ if __name__ == "__main__":
     import json
     result = _reason_on_subgraph(demo, "恶寒 发热")
     print(json.dumps(result, ensure_ascii=False, indent=2))
+
+    # ── 升级B 增量扩散自检 ──
+    # 1) 线索不命中但携带 extra_seeds（上轮余温）→ 不走 insufficient，继续扩散
+    carry = _reason_on_subgraph(demo, "", extra_seeds={"c": 0.5})
+    assert carry["status"] == "ok" and carry["answer"] is not None, carry
+    assert carry["activations"], "余温种子应产出激活序列"
+    print("extra_seeds 纯追问续扩散 ✓  激活:",
+          [a["name"] for a in carry["activations"]])
+
+    # 2) 无 extra_seeds 且线索不命中 → 仍走 insufficient（原语义无回归）
+    bare = _reason_on_subgraph(demo, "不存在的概念")
+    assert bare["status"] == "insufficient" and bare["activations"] == [], bare
+    print("无线索无余温 insufficient 原语义 ✓")
+
+    # 3) 非法/越界 extra_seeds 条目静默丢弃，不炸不污染
+    dirty = _reason_on_subgraph(demo, "恶寒 发热",
+                                extra_seeds={"ghost": "abc", "c": 9.9, "d": -0.5})
+    assert dirty["status"] == "ok", dirty
+    print("非法 extra_seeds 净化 ✓")

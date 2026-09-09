@@ -57,8 +57,15 @@ class BrainSession:
         self._sqlite_path = self._dir / "brain.db"
         self._kuzu_dir = self._dir / "kuzu"
 
-        self._kuzu_db = None
-        self._kuzu_conn = None
+        # Kùzu 线程本地连接（Bug3 修复）：Kùzu 官方保证 Database 线程安全、
+        # Connection 非线程安全 —— 此前全进程共享单连接，提炼引擎线程与
+        # Web 轮询线程并发读写，写入异常被逐条 try/except 吞入 failed，
+        # 进度照常推进（表现为 23/23 DONE 但待收纳池 0 条）。
+        # 仿 SQLite TLS 模式：Database 进程单例，每线程独立 Connection。
+        self._kuzu_db = None                      # Database 单例（懒建，_init_lock 保护）
+        self._kuzu_tls = threading.local()        # 线程本地 Connection 槽位
+        self._kuzu_conns: dict[int, object] = {}  # 线程 id → Connection（close 统一回收）
+        self._kuzu_lock = threading.Lock()        # 保护登记表
 
         # SQLite 线程本地连接：API 线程与提炼引擎线程各自独立建连。
         # 依据：共享单连接时 FULLMUTEX 只保证单条 C 调用原子，
@@ -117,40 +124,60 @@ class BrainSession:
 
     def get_kuzu(self):
         """
-        获取本脑的 Kùzu 连接（首次调用时建目录并实例化图引擎）。
+        获取本线程专属的 Kùzu 连接（Bug3 修复：线程本地化）。
 
-        kuzu.Database 指向不存在目录时会自动初始化空图；
-        懒加载 import kuzu 使纯手工模式的冷启动不被 C++ 扩展拖慢。
+        线程模型依据 Kùzu 官方文档：Database 可多线程共享，Connection
+        绝不可跨线程使用。此前单例连接被提炼线程与 Web 轮询线程并发
+        调用，内部异常被 commit_proposals 的逐条 try/except 吞入 failed，
+        表层进度照常推进 —— 即「23/23 完成但待收纳池全空」的直接根因。
 
-        Task 9.1（Milestone 9 修复）：建连成功后立即执行幂等 Schema 初始化。
-        空库若无 Concept/SYNAPSE 表，任何图谱查询都会 Binder exception（500）；
-        init_schema 先 SHOW TABLES 探测再建表，老库重复执行零副作用。
-        初始化失败时回滚并关闭句柄、复位 None，绝不缓存半初始化连接。
+        结构：Database 进程级单例（_init_lock 双重检查保护，含幂等
+        Schema 初始化）；Connection 每线程独立建立并登记，跨线程写写
+        碰撞由 Kùzu 内部 MVCC/锁兜底。懒加载 import kuzu 使纯手工模式
+        的冷启动不被 C++ 扩展拖慢。
         """
-        if self._kuzu_conn is None:
-            with self._init_lock:
-                if self._kuzu_conn is None:  # 双重检查
-                    import kuzu  # 延迟导入：仅真正用到图谱时加载
-                    self._dir.mkdir(parents=True, exist_ok=True)
-                    db = kuzu.Database(str(self._kuzu_dir))
-                    conn = None
+        conn = getattr(self._kuzu_tls, "conn", None)
+        if conn is not None:
+            return conn
+
+        # 每线程首次调用：确保 Database 单例就绪（幂等 Schema 初始化在首建时执行一次）
+        with self._init_lock:
+            if self._kuzu_db is None:
+                import kuzu  # 延迟导入：仅真正用到图谱时加载
+                self._dir.mkdir(parents=True, exist_ok=True)
+                db = kuzu.Database(str(self._kuzu_dir))
+                probe = None
+                try:
+                    probe = kuzu.Connection(db)
+                    from core.graph_cortex import init_schema  # 延迟导入，避免环依赖
+                    init_schema(probe)
+                    self._kuzu_db = db
+                    logger.info("Kùzu 实例就绪: brain=%s → %s", self.brain_id, self._kuzu_dir)
+                except Exception:
+                    # 半初始化回滚：关闭句柄并保持 None，下次调用可重试
                     try:
-                        conn = kuzu.Connection(db)
-                        from core.graph_cortex import init_schema  # 延迟导入，避免环依赖
-                        init_schema(conn)
-                        self._kuzu_db = db
-                        self._kuzu_conn = conn
-                        logger.info("Kùzu 实例就绪: brain=%s → %s", self.brain_id, self._kuzu_dir)
-                    except Exception:
-                        # 半初始化回滚：关闭句柄并保持 None，下次调用可重试
+                        if probe is not None:
+                            probe.close()
+                        db.close()
+                    except Exception:  # 关闭异常一并吞掉，保留原始异常向上抛
+                        pass
+                    raise
+                finally:
+                    # 探测连接仅用于建 Schema，用完即还，不占用线程槽位
+                    if probe is not None:
                         try:
-                            if conn is not None:
-                                conn.close()
-                            db.close()
-                        except Exception:  # 关闭异常一并吞掉，保留原始异常向上抛
+                            probe.close()
+                        except Exception:
                             pass
-                        raise
-        return self._kuzu_conn
+
+        # Database 已就绪，为本线程建立专属 Connection
+        import kuzu
+        conn = kuzu.Connection(self._kuzu_db)
+        self._kuzu_tls.conn = conn
+        with self._kuzu_lock:
+            self._kuzu_conns[threading.get_ident()] = conn
+        logger.info("Kùzu 线程连接就绪: brain=%s thread=%s", self.brain_id, threading.get_ident())
+        return conn
 
     @property
     def kuzu_dir(self) -> str:
@@ -161,18 +188,48 @@ class BrainSession:
     # 句柄释放（低层；注册表级安全释放见 Task 2.2.3 close_brain）
     # ───────────────────────────────────────────────
 
+    def checkpoint_kuzu(self) -> None:
+        """
+        尽力对本线程持有的 Kùzu 连接执行 CHECKPOINT（WAL → 主文件落盘）。
+
+        背景：Kùzu ≥0.11 默认 WAL 模式，commit 后数据滞留 kuzu.wal，
+        主文件可能是空壳 —— persistence 刷盘若只拷主文件，镜像即残缺。
+        调用时机：persistence 刷盘该脑之前（intake 写后 _flush 与本方法
+        同处写请求线程，其 TLS 连接恰是最新写连接，主路径必命中）。
+
+        失败语义：CHECKPOINT 语法随版本差异/存在活动事务时可能失败，
+        一律静默（persistence 会把 kuzu.wal 一并镜像兜底，恢复时自动 replay）。
+        """
+        conn = getattr(self._kuzu_tls, "conn", None)
+        if conn is None:
+            return  # 本线程未持有连接（如定时刷盘线程），交给 WAL 镜像兜底
+        for stmt in ("CHECKPOINT;", "CALL force_checkpoint=true;"):
+            try:
+                conn.execute(stmt)
+                return
+            except Exception:
+                continue  # 语法不兼容则尝试下一写法，全失败由 WAL 兜底
+
     def close(self) -> None:
-        """释放本脑全部句柄：Kùzu 实例显式 close（防文件句柄占用导致刷盘失败）+ SQLite 断连。"""
+        """释放本脑全部句柄：Kùzu 实例与全部线程连接显式 close（防文件句柄占用导致刷盘失败）+ SQLite 断连。"""
         with self._init_lock:
-            if self._kuzu_conn is not None:
+            # 关闭全部线程的 Kùzu Connection（含已终止线程的残留句柄，防泄漏）
+            with self._kuzu_lock:
+                for tid, conn in self._kuzu_conns.items():
+                    try:
+                        conn.close()
+                    except Exception as exc:  # kuzu 异常类型不稳，兜底捕获
+                        logger.warning("brain=%s Kùzu 线程连接关闭异常（忽略）: %s", self.brain_id, exc)
+                self._kuzu_conns.clear()
+            self._kuzu_tls.conn = None
+
+            if self._kuzu_db is not None:
                 try:
-                    self._kuzu_conn.close()
-                    if self._kuzu_db is not None:
-                        self._kuzu_db.close()
+                    self._kuzu_db.close()
                 except Exception as exc:  # kuzu 异常类型不稳，兜底捕获
-                    logger.warning("brain=%s Kùzu 关闭异常（忽略）: %s", self.brain_id, exc)
-                self._kuzu_conn = None
+                    logger.warning("brain=%s Kùzu Database 关闭异常（忽略）: %s", self.brain_id, exc)
                 self._kuzu_db = None
+            logger.info("brain=%s Kùzu 句柄已全部释放", self.brain_id)
 
             # 回收全部线程本地连接（含已终止线程的残留句柄，防泄漏）
             with self._sqlite_lock:
@@ -288,11 +345,30 @@ def close_brain(brain_id: str) -> None:
         return
 
     # 2) 关闭前强制刷盘：句柄活着的时候才能把缓冲数据写出去
+    #    （多脑布局修复后按 brain_id 精准刷本脑镜像，不再全量扫盘）
     try:
-        result = _persistence.sync_to_storage()
+        result = _persistence.sync_to_storage(brain_id)
         logger.info("close_brain: brain=%s 关闭前刷盘完成 %s", brain_id, result)
     except Exception as exc:  # 刷盘异常绝不阻断句柄释放
         logger.error("close_brain: brain=%s 关闭前刷盘失败（/data 保留旧镜像）: %s", brain_id, exc)
 
     # 3) 显式释放 Kùzu 与 SQLite 句柄，杜绝 NFS 文件锁悬挂
     session.close()
+
+
+def checkpoint_brain(brain_id: str) -> None:
+    """
+    模块级入口：请指定脑执行 Kùzu CHECKPOINT（WAL → 主文件落盘）。
+
+    供 persistence 刷盘前预处理调用（延迟导入，规避循环依赖）。
+    线程模型约束：Kùzu Connection 线程本地，本函数只能对本线程
+    持有的连接执行 CHECKPOINT —— 写请求线程（intake._flush 触发的
+    刷盘）其 TLS 连接恰是最新写连接，主路径必命中；定时刷盘线程
+    未持有连接时静默跳过，由 persistence 的 kuzu.wal 镜像兜底
+    （恢复时 Kùzu 自动 replay WAL）。
+    """
+    validate_brain_id(brain_id)
+    with _registry_lock:
+        session = _brain_registry.get(brain_id)
+    if session is not None:
+        session.checkpoint_kuzu()

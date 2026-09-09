@@ -33,7 +33,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Form, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Form, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 from pydantic import ValidationError
@@ -447,7 +447,7 @@ def api_create_synapse(payload: dict):
     try:
         rid = add_synapse(session.get_kuzu(), body.src_id, body.dst_id,
                           body.relation, body.weight, body.evidence,
-                          status="CONFIRMED")
+                          status="CONFIRMED", knowledge_source="manual")
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     persistence.sync_to_storage()
@@ -488,7 +488,8 @@ def api_create_rule(payload: dict):
     rel_ids = []
     for cond_name in body.conditions:
         rid = add_synapse(conn, by_name[cond_name], conclusion_id,
-                          "causes", 0.8, rule_evidence, status="CONFIRMED")
+                          "causes", 0.8, rule_evidence, status="CONFIRMED",
+                          knowledge_source="manual")
         rel_ids.append(rid)
     persistence.sync_to_storage()
     return {"created": True, "rel_ids": rel_ids,
@@ -663,6 +664,13 @@ def api_create_doc(payload: dict):
 
     conn = get_or_create(_DEFAULT_BRAIN).get_sqlite()
     doc_id = intake_store.create_doc(conn, title, text)
+    # 投喂即刷盘（BugFix：文档此前仅存工作副本，容器重启即丢待提炼内容）。
+    # 失败仅告警不阻断：内存态已正确，定时兜底刷盘还会再试。
+    try:
+        from storage.persistence import sync_to_storage
+        sync_to_storage(_DEFAULT_BRAIN)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("投喂后刷盘失败（/data 保留旧镜像）: %s", exc)
     return {"ok": True, "doc": intake_store.get_doc(conn, doc_id)}
 
 
@@ -720,6 +728,280 @@ def api_delete_doc(doc_id: int):
     if not intake_store.delete_doc(conn, doc_id):
         raise HTTPException(status_code=404, detail=f"文档不存在: doc={doc_id}")
     return {"ok": True}
+
+
+# ───────────────────────────────────────────────
+# 复审队列（升级A·半自主收纳）：高置信提案自动转正后按比例抽样入队，
+# 人工抽检兜底 —— 维持确认（KEPT，无操作）/ 否决（VETOED，联动回滚）。
+# 队列只读快照存 SQLite auto_review；图谱真相以 Kùzu 突触状态为准。
+# ───────────────────────────────────────────────
+
+@router.get("/api/review")
+def api_list_review(status: str = "PENDING", limit: int = 100, offset: int = 0):
+    """复审队列列表（新→旧；status=PENDING/KEPT/VETOED/空=全部）+ 计数。"""
+    from core.brain_manager import get_or_create
+    from core import intake_store
+
+    try:
+        conn = get_or_create(_DEFAULT_BRAIN).get_sqlite()
+        items = intake_store.list_auto_review(
+            conn,
+            status=status.strip().upper() or None,
+            limit=limit, offset=offset)
+        counts = {
+            "PENDING": intake_store.count_auto_review(conn, "PENDING"),
+            "KEPT": intake_store.count_auto_review(conn, "KEPT"),
+            "VETOED": intake_store.count_auto_review(conn, "VETOED"),
+            "ALL": intake_store.count_auto_review(conn, None),
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"items": items, "counts": counts}
+
+
+@router.post("/api/review/batch")
+def api_resolve_review(payload: dict):
+    """批量裁决复审项：{rel_ids: [...], resolution: "KEPT"|"VETOED"}。
+
+    - KEPT（维持确认）：仅队列侧盖终态章，图谱侧 CONFIRMED 不动；
+    - VETOED（否决）：队列盖终态章 + 图谱侧物理删除该突触（自动转正
+      的误收撤销通道；突触删除不影响概念节点本身）。
+    仅 PENDING 复审项可裁决（终态不可二审，防误覆盖）；单条失败不中断。
+    """
+    from core.brain_manager import get_or_create
+    from core import intake_store
+    from core.graph_cortex import delete_synapse, get_synapse
+
+    body = payload or {}
+    rel_ids = body.get("rel_ids") or []
+    resolution = body.get("resolution")
+    if resolution not in ("KEPT", "VETOED"):
+        raise HTTPException(status_code=400, detail=f"非法 resolution: {resolution!r}")
+    if not isinstance(rel_ids, list) or not rel_ids:
+        raise HTTPException(status_code=400, detail="rel_ids 不得为空")
+
+    session = get_or_create(_DEFAULT_BRAIN)
+    review_conn = session.get_sqlite()
+    graph_conn = session.get_kuzu()
+    res = intake_store.resolve_auto_review(review_conn, rel_ids, resolution)
+    vetoed = []
+    if resolution == "VETOED":
+        for rid in res["succeeded"]:
+            syn = get_synapse(graph_conn, rid)
+            if syn is None:
+                vetoed.append({"rel_id": rid, "removed": False,
+                               "note": "图谱侧突触已不存在（幂等）"})
+                continue
+            if delete_synapse(graph_conn, rid):
+                vetoed.append({"rel_id": rid, "removed": True})
+            else:  # 理论不可达：delete 幂等；防御性兜底
+                vetoed.append({"rel_id": rid, "removed": False,
+                                "note": "删除失败，队列已裁决但图谱侧仍残留"})
+    if res["succeeded"]:
+        try:
+            from storage.persistence import sync_to_storage
+            sync_to_storage(_DEFAULT_BRAIN)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("复审裁决后刷盘失败（/data 保留旧镜像）: %s", exc)
+    return {"resolution": resolution, "succeeded": res["succeeded"],
+            "missing": res["missing"], "vetoed": vetoed}
+
+
+# ───────────────────────────────────────────────
+# 多轮对话推演 API（升级B）：会话生命周期 + 追问统一入口。
+# 会话层（core/dialogue.py）只做上下文快照；推演真相每轮由 CONFIRMED
+# 子图重扩散得出，why 为唯一零图谱例外（引用落轮快照，杜绝图谱后续
+# 变动导致「解释与当初答案不一致」）。
+# ───────────────────────────────────────────────
+
+# 快捷追问按钮的展示话术（空 clue 落快照时的输入原文）
+_DIALOGUE_QUICK = {"why": "为什么", "more": "还有呢"}
+
+
+def _more_carryover(session_id: str) -> Optional[dict]:
+    """「还有呢」余温：自最近含激活的 ok 推演轮提取衰减种子。
+
+    - 跳过 why 轮（零图谱无激活）与 insufficient 轮，不截断追问链；
+    - 排除该轮结论节点（结论多为端点无出边，从它续扩散必然空转）；
+    - 排除后无合格余温 → None（纯追问无余温走 insufficient 原语义）。
+    """
+    from core import dialogue
+
+    for t in reversed(dialogue.get_session(session_id)["turns"]):
+        if t["status"] != "ok" or not t["activations"]:
+            continue
+        ans = t.get("answer") or {}
+        concl = ans.get("conclusion") if isinstance(ans, dict) else None
+        banned = ({str(concl["id"])}
+                  if isinstance(concl, dict) and concl.get("id") else set())
+        seeds = dialogue.carryover_seeds(t, exclude_ids=banned)
+        if seeds:
+            return seeds
+    return None
+
+
+@router.post("/api/dialogue")
+def api_dialogue_turn(payload: dict, background_tasks: BackgroundTasks):
+    """对话推演统一入口：无 session_id 开新会话，有则在该会话内追问。
+
+    - intent=normal（缺省）：真实线索开新轮，全新扩散；
+    - intent=why：回溯最近 ok 轮结论的证据链，零图谱调用；
+    - intent=more：最近 ok 轮 TopN 高能节点衰减作 extra_seeds 续扩散，
+      clue 允许为空（纯「还有呢」靠余温；无线索无余温 → insufficient 原语义）。
+    新会话强制按 normal 语义（追问必有会话上下文，杜绝孤儿空会话）。
+    """
+    from core import dialogue
+    from core.inference import pure_reason
+
+    body = payload or {}
+    clue = str(body.get("clue", "")).strip()
+    title = str(body.get("title", "")).strip()
+    intent = str(body.get("intent") or dialogue.INTENT_NORMAL).strip().lower()
+    session_id = str(body.get("session_id") or "").strip()
+
+    if session_id:
+        try:
+            dialogue.get_session(session_id)   # 不存在先行 404（防误建新会话顶替）
+        except dialogue.DialogueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+    else:
+        session_id = dialogue.create_session(_DEFAULT_BRAIN, title)
+        intent = dialogue.INTENT_NORMAL        # 新会话无上下文，追问语义降级为开新轮
+
+    try:
+        resolved = dialogue.resolve_followup(session_id, intent, clue=clue)
+    except dialogue.DialogueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # 展示话术：快捷追问按钮允许空 clue，落快照以按钮话术为输入原文
+    display_clue = resolved["clue"] or _DIALOGUE_QUICK.get(resolved["intent"], "")
+
+    # why 轮落快照 activations 恒空 → 其后的 more 余温会被空轮截断。
+    # 路由层穿透：more 余温为空时回溯最近含激活轮，且排除该轮结论
+    # 节点（结论多为端点无出边，从它续扩散必然空转 → insufficient）。
+    if resolved["intent"] == dialogue.INTENT_MORE and not resolved["extra_seeds"]:
+        resolved["extra_seeds"] = _more_carryover(session_id)
+
+    why_ref = resolved.get("why_ref")
+    if why_ref is not None:
+        # why 零图谱：结论/证据链引用落轮快照（status=ok 但 activations 恒空）
+        result = {
+            "status": "ok", "message": "", "clue": display_clue, "seeds": {},
+            "answer": {"conclusion": why_ref["conclusion"],
+                       "chain": why_ref["chain"],
+                       "assertion": {"evidence": why_ref["evidence"]}},
+            "activations": [],
+        }
+    else:
+        try:
+            result = pure_reason(_DEFAULT_BRAIN, resolved["clue"],
+                                 extra_seeds=resolved["extra_seeds"])
+        except RuntimeError as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    turn = dialogue.append_turn(session_id, clue=display_clue,
+                                intent=resolved["intent"],
+                                seeds=result.get("seeds") or {}, result=result)
+
+    # 升级C 交互回流：仅 normal 轮（真实用户输入）触发后台解析。why/more
+    # 是快捷追问（话术固定，无知识增量），绝不浪费 LLM 调用；后台执行
+    # 不阻塞推演响应，提案落池后经待收纳池轮询自然浮现供人工处置。
+    if resolved["intent"] == dialogue.INTENT_NORMAL:
+        background_tasks.add_task(
+            _dialogue_reflow_task, session_id, turn["turn_index"],
+            resolved["clue"], (result.get("answer") or {}).get("assertion", {}).get("evidence", ""))
+
+    return {"session_id": session_id, "turn": turn}
+
+
+def _reflow_evidence_prefix(session_id: str, turn_index: int) -> str:
+    """回流证据溯源前缀：[对话回流 ss..#N]，供人工处置时回查语境。"""
+    return f"[对话回流 {session_id[:8]}#{turn_index}] "
+
+
+async def _dialogue_reflow_task(session_id: str, turn_index: int,
+                                clue: str, last_assertion: str):
+    """升级C 后台回流任务（协程，Starlette 原生支持）：解析 → 落池。
+
+    铁律：
+    - 一律 knowledge_source=dialogue + PENDING（C1 已收窄白名单，
+      dialogue 通道绝不自动转正，转正权完全归人工）；
+    - evidence 统一加溯源前缀，审核者可凭 session/轮次回查对话原文；
+    - 任何失败（LLM 未配置/网络错误/解析失败/落库失败）仅记日志，
+      绝不向上抛 —— 后台任务不影响推演主链路；
+    - LLM 未配置时静默跳过（回流是增强能力，不是必需依赖）。
+    """
+    from core.brain_manager import get_or_create
+    from core.intake import commit_proposals
+    from core.metabolism import (
+        MetabolismError,
+        areflect_extract_proposals,
+        is_llm_configured,
+    )
+
+    if not is_llm_configured():
+        logger.info("对话回流跳过（LLM 未配置）: session=%s turn=%d",
+                    session_id, turn_index)
+        return
+    try:
+        parsed = await areflect_extract_proposals(clue, answer=last_assertion)
+    except MetabolismError as exc:
+        logger.warning("对话回流解析失败（不影响推演）: session=%s turn=%d: %s",
+                       session_id, turn_index, exc)
+        return
+
+    prefix = _reflow_evidence_prefix(session_id, turn_index)
+    proposals = []
+    for p in parsed["proposals"]:
+        ev = (p.get("evidence") or "").strip()
+        p["evidence"] = (prefix + ev) if ev else prefix.strip()
+        proposals.append(p)
+    if not proposals:
+        logger.info("对话回流零提案: session=%s turn=%d", session_id, turn_index)
+        return
+
+    try:
+        session = get_or_create(_DEFAULT_BRAIN)
+        summary = commit_proposals(
+            session.get_kuzu(), proposals,
+            sqlite_conn=session.get_sqlite(),
+            knowledge_source="dialogue")
+        logger.info("对话回流落池: session=%s turn=%d → %d 条 PENDING"
+                    "（新建概念 %d，失败 %d）",
+                    session_id, turn_index,
+                    len(summary["committed"]), summary["concepts_created"],
+                    len(summary["failed"]))
+    except Exception as exc:
+        logger.warning("对话回流落池失败（不影响推演）: session=%s turn=%d: %s",
+                       session_id, turn_index, exc)
+
+
+@router.get("/api/dialogue")
+def api_list_dialogues():
+    """会话摘要列表（新→旧），供前端会话选择器。"""
+    from core import dialogue
+    return {"items": dialogue.list_sessions(_DEFAULT_BRAIN)}
+
+
+@router.get("/api/dialogue/{session_id}")
+def api_get_dialogue(session_id: str):
+    """会话全量详情（含全部轮次快照，消息流直接渲染）。"""
+    from core import dialogue
+    try:
+        return {"session": dialogue.get_session(session_id)}
+    except dialogue.DialogueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@router.delete("/api/dialogue/{session_id}")
+def api_close_dialogue(session_id: str):
+    """关闭并移除会话（显式丢弃追问链；不存在 404）。"""
+    from core import dialogue
+    if not dialogue.close_session(session_id):
+        raise HTTPException(status_code=404, detail=f"对话会话不存在: {session_id}")
+    return {"closed": True, "session_id": session_id}
 
 
 # ───────────────────────────────────────────────
@@ -815,11 +1097,19 @@ if __name__ == "__main__":
         def get_kuzu(self):
             return _kuzu_conn
 
+        def get_sqlite(self):   # 升级A: 复审队列 API 用的 SQLite 替身（内存库零落盘）
+            return _smoke_sqlite
+
+    import sqlite3 as _sqlite3_mod
+    # check_same_thread=False：TestClient 在工作线程跑请求处理器，替身连接需跨线程
+    _smoke_sqlite = _sqlite3_mod.connect(":memory:", check_same_thread=False)
+    _smoke_sqlite.row_factory = _sqlite3_mod.Row
+
     _gc.init_schema(_kuzu_conn)                      # 面板端点首次使用前建表
     _orig_get_or_create = _bm.get_or_create
     _orig_sync = _persistence_mod.sync_to_storage
     _bm.get_or_create = lambda brain_id: _FakeSession()   # 延迟导入均经模块属性取值
-    _persistence_mod.sync_to_storage = lambda: {"synced": False}
+    _persistence_mod.sync_to_storage = lambda *a, **k: {"synced": False}  # 兼容按脑刷盘签名
 
     tmp = tempfile.mkdtemp(prefix="smoke_login_")
     try:
@@ -1042,6 +1332,171 @@ if __name__ == "__main__":
         body = r.json()
         assert r.status_code == 200 and body["created"] and body["fanin"] == 2, (r.status_code, body)
         print("规则断言物化 ✓（缺概念 400 / 双前提 fanin=2）")
+
+        # ── 升级A: 复审队列 API 自检（auto_review 内存库 + 临时 Kùzu 联动）──
+        from core import intake_store as _is
+        _is.enqueue_auto_review(_smoke_sqlite, [
+            {"rel_id": "s_review_a", "src_name": "高置信甲", "dst_name": "高置信乙",
+             "relation": "导致", "weight": 0.95, "evidence": "抽样命中的自动转正提案"},
+            {"rel_id": "s_review_b", "src_name": "高置信丙", "dst_name": "高置信丁",
+             "relation": "提示", "weight": 0.92, "evidence": "另一条抽样命中的提案"},
+        ])
+        # 26) 复审列表：计数与条目；非法 status → 400
+        r = client.get("/api/review", **auth)
+        body = r.json()
+        assert r.status_code == 200 and body["counts"]["PENDING"] == 2, (r.status_code, body)
+        assert len(body["items"]) == 2 and body["items"][0]["rel_id"] == "s_review_b", body
+        r = client.get("/api/review", params={"status": "BOGUS"}, **auth)
+        assert r.status_code == 400, r.status_code
+        # 27) 否决 s_review_b：队列 VETOED + 图谱侧无此突触（幂等不报错）
+        r = client.post("/api/review/batch",
+                        json={"rel_ids": ["s_review_b"], "resolution": "VETOED"}, **auth)
+        body = r.json()
+        assert r.status_code == 200 and body["succeeded"] == ["s_review_b"], (r.status_code, body)
+        assert body["vetoed"][0]["removed"] is False, body        # 图谱本无该边 → 幂等
+        r = client.get("/api/review", **auth)
+        assert r.json()["counts"]["VETOED"] == 1 and r.json()["counts"]["PENDING"] == 1
+        # 28) 终态防二审：再裁 s_review_b → missing；非法 resolution → 400
+        r = client.post("/api/review/batch",
+                        json={"rel_ids": ["s_review_b"], "resolution": "KEPT"}, **auth)
+        assert r.json()["missing"] == ["s_review_b"], r.json()
+        r = client.post("/api/review/batch",
+                        json={"rel_ids": ["s_review_a"], "resolution": "BOGUS"}, **auth)
+        assert r.status_code == 400, r.status_code
+        # 29) 维持确认 s_review_a（KEPT 仅队列盖章）→ 队列清零 PENDING
+        r = client.post("/api/review/batch",
+                        json={"rel_ids": ["s_review_a"], "resolution": "KEPT"}, **auth)
+        body = r.json()
+        assert r.status_code == 200 and body["succeeded"] == ["s_review_a"] and body["vetoed"] == [], body
+        r = client.get("/api/review", **auth)
+        assert r.json()["counts"]["PENDING"] == 0 and r.json()["counts"]["KEPT"] == 1
+        print("复审队列 API ✓（列表计数 / VETOED 幂等联动 / 终态防二审 / KEPT 盖章）")
+
+        # ── 升级B: 多轮对话推演 API 自检（复用上述临时 Kùzu 子图）──
+        from core import dialogue as _dlg
+        # 30) 新会话首轮：恶寒+发热 → 规则物化子图命中太阳伤寒
+        r = client.post("/api/dialogue", json={"clue": "恶寒 发热"}, **auth)
+        body = r.json()
+        assert r.status_code == 200, (r.status_code, body)
+        sid = body["session_id"]
+        t0 = body["turn"]
+        assert t0["turn_index"] == 0 and t0["intent"] == "normal" \
+            and t0["status"] == "ok", t0
+        assert t0["answer"]["conclusion"]["name"] == "太阳伤寒", t0
+        print("对话 API 新会话首轮推演 ✓（规则命中太阳伤寒）")
+
+        # 31) why 追问：回溯首轮结论证据链，零图谱（activations 恒空）
+        r = client.post("/api/dialogue", json={"session_id": sid, "intent": "why"}, **auth)
+        t1 = r.json()["turn"]
+        assert r.status_code == 200 and t1["intent"] == "why" \
+            and t1["status"] == "ok" and t1["activations"] == [], t1
+        assert t1["answer"]["conclusion"]["name"] == "太阳伤寒", t1
+        assert t1["answer"]["chain"], "why 应携带落轮证据链"
+        assert t1["clue"] == "为什么", "空 clue 应落快捷按钮话术"
+        print("对话 API why 回溯证据链 ✓")
+
+        # 32) more 追问：why 轮无激活不截断余温 → 穿透取首轮高能节点续扩散
+        r = client.post("/api/dialogue", json={"session_id": sid, "intent": "more"}, **auth)
+        t2 = r.json()["turn"]
+        assert r.status_code == 200 and t2["intent"] == "more" \
+            and t2["status"] == "ok" and t2["activations"], t2
+        assert t2["seeds"], "余温种子应并入本轮扩散"
+        print("对话 API more 余温续扩散 ✓（穿透 why 空轮）")
+
+        # 33) 会话列表 + 全量详情
+        r = client.get("/api/dialogue", **auth)
+        items = r.json()["items"]
+        assert r.status_code == 200 and items and items[0]["session_id"] == sid \
+            and items[0]["turn_count"] == 3, items
+        r = client.get(f"/api/dialogue/{sid}", **auth)
+        sess = r.json()["session"]
+        assert r.status_code == 200 and len(sess["turns"]) == 3 \
+            and sess["title"] == "恶寒 发热", sess
+
+        # ── 升级C: 对话回流自检（monkeypatch 解析器，零网络）──
+        # 34) normal 轮触发后台回流：纠正话语 → 解析 → 落池
+        #     knowledge_source=dialogue + 一律 PENDING + evidence 溯源前缀。
+        import asyncio as _aio
+        import api.web_routes as _wr
+        _captured = {}
+
+        async def _fake_areflect(clue, *, answer="", timeout=120.0):
+            _captured["clue"] = clue
+            _captured["answer"] = answer
+            return {"proposals": [{
+                "source": "桂枝", "target": "卫气不固", "relation": "主治",
+                "weight": 0.9, "evidence": "用户说：桂枝加桂汤更治气从少腹上冲心",
+                "confidence": 0.99, "merge": "越权字段应被剔除",
+            }], "raw": "[]", "dropped": 0}
+
+        from core import metabolism as _meta
+        _meta.areflect_extract_proposals, _saved = _fake_areflect, _meta.areflect_extract_proposals
+        try:
+            r = client.post("/api/dialogue",
+                            json={"session_id": sid,
+                                  "clue": "桂枝能治卫气不固，我记得桂枝加桂汤主治这个"}, **auth)
+            assert r.status_code == 200, (r.status_code, r.text)
+            t3 = r.json()["turn"]
+            assert t3["intent"] == "normal" and t3["turn_index"] == 3, t3
+            # 语境透传：answer 为上一轮答案摘要（该轮可能 insufficient，
+            # 图谱未必含桂枝相关节点，故只断类型不断内容）
+            assert isinstance(_captured.get("answer") or "", str), _captured
+        finally:
+            _meta.areflect_extract_proposals = _saved
+
+        # 手动执行后台任务本体（patch 期间捕获语境，patch 后落库不受影响）：
+        # 复现路由注入的调用参数（session/turn/clue/last_assertion）；
+        # is_llm_configured 一并 patch —— 自检环境无 LLM 三元组，任务
+        # 会按铁律静默跳过，此处仅解锁预检、解析仍走 fake（零网络）。
+        _meta.areflect_extract_proposals, _saved = _fake_areflect, _meta.areflect_extract_proposals
+        _meta.is_llm_configured, _saved_cfg = (lambda: True), _meta.is_llm_configured
+        try:
+            _aio.new_event_loop().run_until_complete(
+                _wr._dialogue_reflow_task(
+                    sid, 3, "桂枝能治卫气不固，我记得桂枝加桂汤主治这个",
+                    "桂枝汤主治太阳伤寒"))
+        finally:
+            _meta.areflect_extract_proposals = _saved
+            _meta.is_llm_configured = _saved_cfg
+
+        # 35) 回流落池断言：PENDING 池出现桂枝→卫气不固，evidence 带溯源前缀
+        from core.brain_manager import get_or_create
+        from core.intake import list_pending as _lp
+        _pend = _lp(get_or_create(_DEFAULT_BRAIN).get_kuzu())
+        _hit = [p for p in _pend if p["src_name"] == "桂枝" and p["dst_name"] == "卫气不固"]
+        assert _hit, "回流提案应入 PENDING 池"
+        _ev = _hit[0]["evidence"]
+        assert _ev.startswith("[对话回流") and "#3]" in _ev, _ev
+        assert "用户说" in _ev, _ev
+        assert "merge" not in _ev and "更治" in _ev, _ev
+        # 36) 来源标记：落库边 knowledge_source=dialogue（C1 管道贯通断言）
+        from core.graph_cortex import get_synapse as _gs
+        _syn = _gs(get_or_create(_DEFAULT_BRAIN).get_kuzu(), _hit[0]["rel_id"])
+        assert _syn["knowledge_source"] == "dialogue", _syn
+        assert _syn["status"] == "PENDING", "对话回流绝不自动转正"
+        print("对话回流 API ✓（后台落池 / PENDING / 溯源前缀 / dialogue 标记）")
+        print("对话列表 / 详情 ✓")
+
+        # 34) 语义码：不存在会话 404；无 ok 轮空 why → 400；普通轮空 clue → 400
+        r = client.post("/api/dialogue", json={"session_id": "ghost", "intent": "why"}, **auth)
+        assert r.status_code == 404, r.status_code
+        r2 = client.post("/api/dialogue", json={"clue": "玄学不通"}, **auth)
+        sid2 = r2.json()["session_id"]
+        assert r2.json()["turn"]["status"] == "insufficient", r2.json()
+        r = client.post("/api/dialogue", json={"session_id": sid2, "intent": "why"}, **auth)
+        assert r.status_code == 400, (r.status_code, r.text[:120])
+        r = client.post("/api/dialogue", json={"session_id": sid2, "intent": "normal"}, **auth)
+        assert r.status_code == 400, r.status_code
+        print("对话语义码 ✓（404 / 无 ok 轮 400 / 空 clue 400）")
+
+        # 35) 关闭：DELETE 幂等（存在 True → 再删 404）；关闭后追问 404
+        r = client.delete(f"/api/dialogue/{sid2}", **auth)
+        assert r.status_code == 200 and r.json() == {"closed": True, "session_id": sid2}, r.json()
+        r = client.delete(f"/api/dialogue/{sid2}", **auth)
+        assert r.status_code == 404, r.status_code
+        r = client.post("/api/dialogue", json={"session_id": sid2, "clue": "再问"}, **auth)
+        assert r.status_code == 404, r.status_code
+        print("对话关闭幂等 ✓")
 
         print("web_routes 冒烟自检全部通过 ✓")
     finally:

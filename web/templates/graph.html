@@ -26,6 +26,23 @@
   <div id="reasonOut"></div>
 </div>
 
+<!-- 多轮对话推演（升级B：追问链保留上下文，为什么/还有呢） -->
+<div class="card" id="dlgCard">
+  <h2>③ 对话推演（多轮追问链 · 上下文保留 · 增量扩散）</h2>
+  <div class="row" style="align-items:flex-end;gap:10px;flex-wrap:wrap">
+    <div style="flex:1;min-width:240px"><label>推演线索</label><input type="text" id="dlgClue" list="dlConcepts" placeholder="首轮必填；追问可只点快捷按钮" maxlength="256"></div>
+    <div style="max-width:220px"><label>会话标题（可选）</label><input type="text" id="dlgTitle" placeholder="缺省取首轮线索" maxlength="128"></div>
+  </div>
+  <div class="actions">
+    <button id="btnDlgSend">发送</button>
+    <button class="ghost" id="btnDlgWhy" type="button" hidden>为什么？</button>
+    <button class="ghost" id="btnDlgMore" type="button" hidden>还有呢？</button>
+    <button class="ghost" id="btnDlgClose" type="button" hidden>结束会话</button>
+    <span class="msg" id="msgDlg"></span>
+  </div>
+  <div id="dlgStream" style="display:flex;flex-direction:column;gap:10px;margin-top:10px"></div>
+</div>
+
 <script>
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
@@ -169,9 +186,112 @@ $("btnPulseReplay").addEventListener("click", async () => {
   finally { $("btnPulseReplay").disabled = false; }
 });
 
+// ── 多轮对话推演（升级B）：追问链消息流 ──
+// 铁律对齐：气泡内结论与证据链 100% 来自 /api/dialogue 轮次快照
+// （B4 已保证 why 引用落轮快照、推演真相每轮重扩散），前端只做可视化。
+let dlgSessionId = null;   // 当前会话 id（null = 尚未开启）
+
+function dlgBubbleUser(clue) {
+  return `<div style="align-self:flex-end;max-width:78%;background:#1b2c4f;border:1px solid #2c4370;border-radius:12px 12px 3px 12px;padding:8px 12px;font-size:13px">${esc(clue)}</div>`;
+}
+
+function dlgBubbleBot(turn) {
+  const a = turn.answer;
+  if (turn.status !== "ok" || !a || !a.conclusion) {
+    return `<div style="align-self:flex-start;max-width:86%;background:#0f1d2e;border:1px solid #23324f;border-radius:12px 12px 12px 3px;padding:8px 12px;font-size:13px;color:#9fb3d9">🧠 ${esc(turn.message || "尚未掌握该知识")}</div>`;
+  }
+  // id → 概念名映射：链上仅含 id，名称取自本轮激活序列与结论（缺失回退 id 前缀）
+  const names = new Map();
+  for (const act of turn.activations || []) if (act.name) names.set(act.id, act.name);
+  if (a.conclusion.name) names.set(a.conclusion.id, a.conclusion.name);
+  const nm = (id) => esc(names.get(id) || String(id).slice(0, 12));
+  const chainRows = (a.chain || []).map((s, i) => `
+    <div style="padding:6px 10px;border-left:3px solid #ffd28a;background:#101a30;border-radius:6px;margin:5px 0;font-size:12.5px">
+      <span style="color:#5d6f94;white-space:nowrap">第 ${i + 1} 跳</span>
+      <span style="white-space:nowrap"> ${nm(s.src_id)} <span style="color:#ffd28a">—[${esc(s.relation || "relates")}]→</span> ${nm(s.dst_id)}</span>
+      ${s.evidence ? `<div style="color:#9fb3d9;margin-top:3px">证据：${esc(s.evidence)}</div>` : ""}
+    </div>`).join("");
+  const evi = ((a.assertion && a.assertion.evidence) || [])
+    .map((e) => `<div style="padding:5px 10px;border-left:3px solid #7fe3a0;background:#0f1d2e;border-radius:6px;margin:5px 0;font-size:12.5px">${esc(e)}</div>`).join("");
+  const head = turn.intent === "why" ? `依据（第 ${turn.turn_index - 1} 轮结论的证据链）` : "推演结论";
+  return `<div style="align-self:flex-start;max-width:86%;background:#0c1425;border:1px solid #23324f;border-radius:12px 12px 12px 3px;padding:9px 12px;font-size:13px">
+    <div style="font-size:12px;color:#5d6f94">🧠 ${head}</div>
+    <div style="font-weight:700;margin:3px 0;color:#7fe3a0">${esc(a.conclusion.name || a.conclusion.id)}</div>
+    ${chainRows || "<div style='color:#5d6f94;font-size:12.5px'>结论即线索命中概念，无传导边。</div>"}
+    ${evi ? `<div style="font-size:12px;color:#9fb3d9;margin-top:6px">断言出处：</div>${evi}` : ""}
+  </div>`;
+}
+
+function dlgAppend(turn) {
+  const stream = $("dlgStream");
+  stream.insertAdjacentHTML("beforeend", dlgBubbleUser(turn.clue) + dlgBubbleBot(turn));
+  stream.scrollTop = stream.scrollHeight;
+}
+
+function dlgButtons(hasConcluded) {
+  $("btnDlgWhy").hidden = !hasConcluded;   // why 需存在可回溯的结论
+  $("btnDlgMore").hidden = !dlgSessionId;  // more 仅需会话在（无余温走 insufficient 话术）
+  $("btnDlgClose").hidden = !dlgSessionId;
+}
+
+async function dlgSend(intent, clueOverride) {
+  const clue = (clueOverride ?? $("dlgClue").value).trim();
+  if (!dlgSessionId && !clue) { setMsg("msgDlg", "首轮请输入推演线索", false); return; }
+  $("btnDlgSend").disabled = true;
+  setMsg("msgDlg", "推演中…", true);
+  try {
+    const body = { intent: intent || "normal", clue };
+    if (dlgSessionId) body.session_id = dlgSessionId;
+    else body.title = $("dlgTitle").value.trim();
+    const d = await api("/api/dialogue", { method: "POST", body });
+    dlgSessionId = d.session_id;
+    $("dlgClue").value = "";
+    dlgAppend(d.turn);
+    dlgButtons(!!(d.turn.answer && d.turn.answer.conclusion));
+    setMsg("msgDlg", d.turn.status === "ok" ? "✓ 已回复" : "◦ " + (d.turn.message || "知识不足"), d.turn.status === "ok");
+  } catch (e) {
+    setMsg("msgDlg", "✗ " + e.message, false);
+  } finally {
+    $("btnDlgSend").disabled = false;
+  }
+}
+
+$("btnDlgSend").addEventListener("click", () => dlgSend("normal"));
+$("dlgClue").addEventListener("keydown", (ev) => { if (ev.key === "Enter") dlgSend("normal"); });
+$("btnDlgWhy").addEventListener("click", () => dlgSend("why", ""));
+$("btnDlgMore").addEventListener("click", () => dlgSend("more", ""));
+$("btnDlgClose").addEventListener("click", async () => {
+  if (!dlgSessionId) return;
+  $("btnDlgClose").disabled = true;
+  try {
+    await api("/api/dialogue/" + dlgSessionId, { method: "DELETE" });
+    dlgSessionId = null;
+    dlgButtons(false);
+    setMsg("msgDlg", "✓ 会话已结束（可开启新追问链）", true);
+  } catch (e) {
+    setMsg("msgDlg", "✗ " + e.message, false);
+  } finally { $("btnDlgClose").disabled = false; }
+});
+
+// 刷新恢复：取最近会话详情回放消息流（会话层进程内易失，重启清空属预期）
+async function dlgRestore() {
+  try {
+    const list = await api("/api/dialogue");
+    const latest = (list.items || [])[0];
+    if (!latest) return;
+    const d = await api("/api/dialogue/" + latest.session_id);
+    dlgSessionId = d.session.session_id;
+    for (const t of d.session.turns || []) dlgAppend(t);
+    const lastOk = (d.session.turns || []).filter((t) => t.status === "ok" && t.answer && t.answer.conclusion).pop();
+    dlgButtons(!!lastOk);
+  } catch (e) { console.error("对话会话恢复失败", e); }
+}
+
 (async function boot() {
   try { await loadConcepts(); }
   catch (e) { console.error("概念列表加载失败", e); }
+  try { await dlgRestore(); }   // 升级B：恢复最近对话会话的消息流
+  catch (e) { console.error("对话恢复失败", e); }
 })();
 </script>
 {% endblock %}

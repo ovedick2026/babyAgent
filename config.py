@@ -373,6 +373,54 @@ def is_s3_configured() -> bool:
     return all(bool(v) for v in get_s3().values())
 
 
+# ───────────────────────────────────────────────
+# 半自主收纳参数 (升级A) —— 高置信提案自动收纳 + 抽样复审
+# ───────────────────────────────────────────────
+
+# 自动收纳判定：提案 weight ≥ AUTO_CONFIRM_WEIGHT 且 evidence 长度 ≥
+# AUTO_CONFIRM_MIN_EVIDENCE 时视为「高置信」，落库即转 CONFIRMED；
+# 其余仍走人工确认（低置信不越权）。默认保守：0.9 / 12 字。
+AUTO_CONFIRM_WEIGHT = 0.9
+AUTO_CONFIRM_MIN_EVIDENCE = 12
+
+# 抽样复审比例：自动收纳提案中按此比例（0~1）随机抽样进入复审队列，
+# 供人工抽检自动通道的判定质量；0 = 关闭抽样（全部免审）。
+# 环境变量 SYNAPSEMIND_AUTO_CONFIRM_SAMPLE 可覆盖（0~1 浮点）。
+AUTO_REVIEW_SAMPLE_RATE = 0.2
+
+
+def get_auto_confirm_config() -> dict:
+    """读取自动收纳三参数（常量为默认值，env 可覆盖，便于部署侧调参不改码）。
+
+    Returns:
+        {"weight_threshold": float, "min_evidence_len": int, "sample_rate": float}
+    """
+    weight = AUTO_CONFIRM_WEIGHT
+    evidence = AUTO_CONFIRM_MIN_EVIDENCE
+    sample = AUTO_REVIEW_SAMPLE_RATE
+    try:
+        weight = float(os.environ.get("SYNAPSEMIND_AUTO_CONFIRM_WEIGHT", weight))
+    except (TypeError, ValueError):
+        pass
+    try:
+        evidence = int(os.environ.get("SYNAPSEMIND_AUTO_CONFIRM_MIN_EVIDENCE", evidence))
+    except (TypeError, ValueError):
+        pass
+    try:
+        sample = float(os.environ.get("SYNAPSEMIND_AUTO_CONFIRM_SAMPLE", sample))
+    except (TypeError, ValueError):
+        pass
+    # 越界钳制：weight/sample 收进 [0,1]，证据下限不为负
+    weight = min(1.0, max(0.0, weight))
+    sample = min(1.0, max(0.0, sample))
+    evidence = max(0, evidence)
+    return {
+        "weight_threshold": weight,
+        "min_evidence_len": evidence,
+        "sample_rate": sample,
+    }
+
+
 def get_backup_policy() -> dict:
     """读取定时备份策略（hourly/daily 开关与触发时刻），供 Task 1.3.4 注册器调用。"""
     return load_config().get("backup_policy", {})

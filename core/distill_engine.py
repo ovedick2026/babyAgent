@@ -242,7 +242,8 @@ def _run_job(brain_id: str, doc_id: int) -> None:
                 logger.info("doc=%s 段 %d/%d 执行期间被暂停/取消，结果作废",
                             doc_id, idx + 1, total)
                 return
-            summary = commit_proposals(kuzu, result["proposals"])
+            # sqlite_conn 同步传入：高置信自动收纳提案按抽样比例入复审队列
+            summary = commit_proposals(kuzu, result["proposals"], sqlite_conn=conn)
             proposals_total += len(summary["committed"])
             done = idx + 1
             intake_store.update_progress(
@@ -319,9 +320,9 @@ if __name__ == "__main__":
             raise RuntimeError("gate closed")
         return {"proposals": [
             {"source": f"概念{_calls['n']}A", "target": f"概念{_calls['n']}B",
-             "relation": "causes", "weight": 0.5, "evidence": text[:30]},
+             "relation": "导致", "weight": 0.5, "evidence": text[:30]},
             {"source": f"概念{_calls['n']}B", "target": f"概念{_calls['n']}C",
-             "relation": "suggests", "weight": 0.6, "evidence": ""},
+             "relation": "提示", "weight": 0.6, "evidence": ""},
         ], "raw": "[]", "dropped": 0}
 
     _self.skim_extract_proposals = _fake_skim

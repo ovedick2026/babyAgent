@@ -32,12 +32,48 @@ SYNAPSE_STATUSES = ("PENDING", "CONFIRMED", "REJECTED")
 # Schema DDL（Task 3.1.1 基线 + Task 3.1.3 增补 rel_id 稳定寻址）
 # ───────────────────────────────────────────────
 
+# 知识来源标记（升级D·来源分级权限）。
+# 分级语义：intake=书籍类（文档投喂提炼，禁止经对话修改，仅人工可改）；
+# manual/dialogue=经验类（人工手录/对话回流，可经对话修改）；
+# legacy=加字段前的存量数据（从严按书籍类管理，人工可手动改标记）。
+KNOWLEDGE_SOURCES = ("intake", "manual", "dialogue", "legacy")
+DEFAULT_KNOWLEDGE_SOURCE = "intake"   # 缺省从严：未显式标记的一律按书籍类
+
+# 知识类别分级（升级D 主体）：把四种来源归并为两大权限类别。
+# book（书籍类）= intake/legacy：投喂提炼与存量迁移，权威性强，
+#   禁止经对话修改（对话回流提案命中即拒），仅限人工手动修改；
+# experience（经验类）= manual/dialogue：用户亲笔手录与对话回流，
+#   允许经对话纠正/补充（回流提案照常入池，由人工裁决落定）。
+KNOWLEDGE_CLASSES = {
+    "book": ("intake", "legacy"),
+    "experience": ("manual", "dialogue"),
+}
+
+
+def knowledge_class(source: str) -> str:
+    """知识来源 → 权限类别（'book' | 'experience'）。
+
+    铁律：未知/非法来源一律从严判为书籍类（book）—— 分级权限的
+    安全取向是「拿不准就禁止对话修改」，绝不给未知来源放行。
+    """
+    src = (source or "").strip()
+    for cls, members in KNOWLEDGE_CLASSES.items():
+        if src in members:
+            return cls
+    return "book"
+
+
+def is_book_class(source: str) -> bool:
+    """是否书籍类（禁止对话修改）；未知来源从严判 True。"""
+    return knowledge_class(source) == "book"
+
 _CONCEPT_DDL = (
     "CREATE NODE TABLE Concept("
     "id STRING, "
     "name STRING, "
     "category STRING, "
     "description STRING, "
+    "knowledge_source STRING, "
     "PRIMARY KEY(id))"
 )
 
@@ -50,7 +86,8 @@ _SYNAPSE_DDL = (
     "weight DOUBLE, "
     "relation STRING, "
     "evidence STRING, "
-    "status STRING)"
+    "status STRING, "
+    "knowledge_source STRING)"
 )
 
 
@@ -71,6 +108,66 @@ def _existing_tables(conn) -> dict:
         row = result.get_next()
         tables[row[name_i]] = row[type_i]
     return tables
+
+
+def _table_columns(conn, table: str) -> list:
+    """查指定表的列名列表（table_info 动态取列索引，兼容不同版本列序差异）。"""
+    result = conn.execute(f"CALL table_info('{table}') RETURN *")
+    cols = result.get_column_names()
+    name_i = cols.index("name") if "name" in cols else 1
+    out: list = []
+    while result.has_next():
+        out.append(result.get_next()[name_i])
+    return out
+
+
+def _migrate_add_knowledge_source(conn) -> None:
+    """老库换芯：为 Concept/SYNAPSE 补 knowledge_source 列（升级D·前置）。
+
+    Kùzu 0.11.3 不支持 ALTER TABLE ADD PROPERTY（实测 Parser 直接拒绝），
+    采用已在同版本临时库演练通过的五步迁移：
+      RENAME 两表为 *_legacy → 建新表（带 knowledge_source）→
+      拷点 → 按 id 关联拷边 → DROP 旧表（先 REL 后 NODE）。
+
+    存量数据统一记 knowledge_source='legacy'（从严按书籍类管理，
+    人工可在面板手动改标记）。中断恢复：本迁移在单写者模型下瞬时完成，
+    若极端情况中断遗留 *_legacy 表，由 /data 镜像 restore_on_boot 自愈
+    拉回旧结构后重跑迁移（与项目既有自愈哲学一致）。
+
+    Raises:
+        RuntimeError: 检测到新旧表并存的含混中间态（拒绝猜测，交由镜像自愈）。
+    """
+    tables = _existing_tables(conn)
+    has_legacy = "Concept_legacy" in tables or "SYNAPSE_legacy" in tables
+    has_new = "Concept" in tables or "SYNAPSE" in tables
+    if has_legacy and has_new:
+        raise RuntimeError(
+            "knowledge_source 迁移中间态（新旧表并存）：请从 /data 镜像恢复后重试"
+        )
+
+    if not has_legacy:
+        # 正常路径：旧结构原位改名后换芯
+        conn.execute("ALTER TABLE SYNAPSE RENAME TO SYNAPSE_legacy")
+        conn.execute("ALTER TABLE Concept RENAME TO Concept_legacy")
+
+    conn.execute(_CONCEPT_DDL)
+    conn.execute(_SYNAPSE_DDL)
+    conn.execute(
+        "MATCH (n:Concept_legacy) "
+        "CREATE (m:Concept {id: n.id, name: n.name, category: n.category, "
+        "description: n.description, knowledge_source: 'legacy'})"
+    )
+    conn.execute(
+        "MATCH (a:Concept_legacy)-[s:SYNAPSE_legacy]->(b:Concept_legacy), "
+        "(na:Concept), (nb:Concept) "
+        "WHERE na.id = a.id AND nb.id = b.id "
+        "CREATE (na)-[:SYNAPSE {rel_id: s.rel_id, weight: s.weight, "
+        "relation: s.relation, evidence: s.evidence, status: s.status, "
+        "knowledge_source: 'legacy'}]->(nb)"
+    )
+    conn.execute("DROP TABLE SYNAPSE_legacy")   # 先 REL（端点依赖 NODE）
+    conn.execute("DROP TABLE Concept_legacy")
+    logger.info("Schema 迁移: knowledge_source 换芯完成（存量数据标记 legacy）")
 
 
 def init_schema(conn) -> bool:
@@ -99,12 +196,21 @@ def init_schema(conn) -> bool:
         if "Concept" not in tables:
             conn.execute(_CONCEPT_DDL)
             logger.info("Kùzu Schema: 已创建 NODE 表 Concept")
+        elif "knowledge_source" not in _table_columns(conn, "Concept"):
+            # 老结构（升级D 前无 knowledge_source）→ 换芯迁移（一并重建 REL 表）
+            logger.info("Kùzu Schema: 检测到旧结构，启动 knowledge_source 迁移")
+            _migrate_add_knowledge_source(conn)
         else:
             logger.info("Kùzu Schema: NODE 表 Concept 已存在，跳过建表")
 
         if "SYNAPSE" not in tables:
             conn.execute(_SYNAPSE_DDL)
             logger.info("Kùzu Schema: 已创建 REL 表 SYNAPSE")
+        elif "knowledge_source" not in _table_columns(conn, "SYNAPSE") and \
+                "SYNAPSE_legacy" not in _existing_tables(conn):
+            # 单独缺列（Concept 已带列而 SYNAPSE 不带的异常态）也走换芯兜底
+            logger.info("Kùzu Schema: SYNAPSE 缺 knowledge_source，启动迁移")
+            _migrate_add_knowledge_source(conn)
         else:
             logger.info("Kùzu Schema: REL 表 SYNAPSE 已存在，跳过建表")
 
@@ -155,6 +261,7 @@ def add_concept(
     category: str = "general",
     description: str = "",
     concept_id: Optional[str] = None,
+    knowledge_source: str = DEFAULT_KNOWLEDGE_SOURCE,
 ) -> str:
     """
     创建概念节点，返回其唯一 id。
@@ -169,6 +276,8 @@ def add_concept(
         category:    分类标签（≤64 字，默认 general）。
         description: 概念释义（≤2000 字）。
         concept_id:  显式指定 id（批量导入/恢复场景用）；缺省自动生成。
+        knowledge_source: 知识来源标记（intake/manual/dialogue/legacy；
+                升级D 分级权限依据：intake=书籍类禁对话修改，其余=经验类）。
 
     Returns:
         新建概念的 id。
@@ -188,14 +297,20 @@ def add_concept(
     description = description or ""
     if len(description) > 2000:
         raise ValueError(f"description 超长（>{2000} 字）")
+    if knowledge_source not in KNOWLEDGE_SOURCES:
+        raise ValueError(
+            f"非法 knowledge_source={knowledge_source!r}，仅允许 {KNOWLEDGE_SOURCES}"
+        )
 
     cid = concept_id or _new_concept_id()
     _validate_id(cid)
 
     try:
         conn.execute(
-            "CREATE (:Concept {id: $id, name: $name, category: $cat, description: $dsc})",
-            {"id": cid, "name": name, "cat": category, "dsc": description},
+            "CREATE (:Concept {id: $id, name: $name, category: $cat, "
+            "description: $dsc, knowledge_source: $ks})",
+            {"id": cid, "name": name, "cat": category, "dsc": description,
+             "ks": knowledge_source},
         )
     except Exception as exc:
         # id 主键冲突（显式指定重复 id）也在此统一包装
@@ -209,13 +324,15 @@ def get_concept(conn, concept_id: str) -> Optional[dict]:
     """按 id 精确读取单个概念；不存在返回 None。"""
     _validate_id(concept_id)
     result = conn.execute(
-        "MATCH (n:Concept) WHERE n.id = $id RETURN n.id, n.name, n.category, n.description",
+        "MATCH (n:Concept) WHERE n.id = $id "
+        "RETURN n.id, n.name, n.category, n.description, n.knowledge_source",
         {"id": concept_id},
     )
     if not result.has_next():
         return None
     row = result.get_next()
-    return {"id": row[0], "name": row[1], "category": row[2], "description": row[3]}
+    return {"id": row[0], "name": row[1], "category": row[2],
+            "description": row[3], "knowledge_source": row[4]}
 
 
 def update_concept(
@@ -309,7 +426,8 @@ def list_concepts(
         limit:    返回上限（默认 500，防全量渲染卡顿，与局部视口加载原则对齐）。
 
     Returns:
-        [{id, name, category, description}, ...]，按 name 字典序排序。
+        [{id, name, category, description, knowledge_source}, ...]，
+        按 name 字典序排序。
     """
     cypher = "MATCH (n:Concept)"
     where = []
@@ -324,13 +442,15 @@ def list_concepts(
     if where:
         cypher += " WHERE " + " AND ".join(where)
 
-    cypher += " RETURN n.id, n.name, n.category, n.description ORDER BY n.name LIMIT $lim"
+    cypher += (" RETURN n.id, n.name, n.category, n.description, n.knowledge_source"
+               " ORDER BY n.name LIMIT $lim")
 
     result = conn.execute(cypher, params)
     concepts = []
     while result.has_next():
         row = result.get_next()
-        concepts.append({"id": row[0], "name": row[1], "category": row[2], "description": row[3]})
+        concepts.append({"id": row[0], "name": row[1], "category": row[2],
+                         "description": row[3], "knowledge_source": row[4]})
     return concepts
 
 
@@ -377,6 +497,7 @@ def add_synapse(
     evidence: str = "",
     status: str = "PENDING",
     rel_id: Optional[str] = None,
+    knowledge_source: str = DEFAULT_KNOWLEDGE_SOURCE,
 ) -> str:
     """
     创建突触边（有向：src → dst），返回其稳定地址 rel_id。
@@ -393,11 +514,14 @@ def add_synapse(
         conn:     Kùzu Connection。
         src_id:   起点概念 id。
         dst_id:   终点概念 id。
-        relation: 关系标签（非空，≤64 字，如 causes / inhibits / relates）。
+        relation: 关系标签（非空，≤64 字，中文短词如 导致/抑制/提示/属于）。
         weight:   权重 [0.0, 1.0]，默认 0.5。
         evidence: 证据原文片段（≤2000 字），推演回溯与前端证据链打印复用。
         status:   初始状态，默认 PENDING。
         rel_id:   显式指定（恢复/导入场景），缺省自动生成。
+        knowledge_source: 知识来源标记（intake/manual/dialogue/legacy；
+            升级D 分级权限依据：dialogue 来源可经对话修改，intake/legacy
+            按书籍类从严管理）。
 
     Returns:
         新建突触的 rel_id。
@@ -425,6 +549,9 @@ def add_synapse(
         raise ValueError(f"evidence 超长（>{2000} 字）")
     if status not in SYNAPSE_STATUSES:
         raise ValueError(f"非法初始 status={status!r}，仅允许 {SYNAPSE_STATUSES}")
+    if knowledge_source not in KNOWLEDGE_SOURCES:
+        raise ValueError(
+            f"非法 knowledge_source={knowledge_source!r}，仅允许 {KNOWLEDGE_SOURCES}")
 
     rid = rel_id or _new_rel_id()
     _validate_rel_id(rid)
@@ -434,9 +561,10 @@ def add_synapse(
             "MATCH (a:Concept), (b:Concept) "
             "WHERE a.id = $src AND b.id = $dst "
             "CREATE (a)-[:SYNAPSE {rel_id: $rid, weight: $w, relation: $rel, "
-            "evidence: $ev, status: $st}]->(b)",
+            "evidence: $ev, status: $st, knowledge_source: $ks}]->(b)",
             {"src": src_id, "dst": dst_id, "rid": rid, "w": w,
-             "rel": relation, "ev": evidence, "st": status},
+             "rel": relation, "ev": evidence, "st": status,
+             "ks": knowledge_source},
         )
     except Exception as exc:
         raise RuntimeError(f"突触写入失败 ({src_id}→{dst_id}): {exc}") from exc
@@ -446,12 +574,41 @@ def add_synapse(
     return rid
 
 
+def get_confirmed_edge(conn, src_id: str, dst_id: str,
+                       relation: str) -> Optional[dict]:
+    """按有向端点对 + 关系词精确查既有 CONFIRMED 突触（升级D 审查用）。
+
+    - 仅认 CONFIRMED：PENDING/REJECTED 不是已学知识，不构成修改对象；
+    - 有向语义：src→dst 与 dst→src 是两条不同的知识，不互查反向；
+    - relation 精确匹配（ relation 本就是自由标签，不做同义词归并——
+      归并属概念工程，超出分级权限的审查职责）；
+    - 同端点对同关系可能多条（历史多次确认），任取一条（分级判定只需
+      类别，不关心具体权重）。
+
+    Returns:
+        {rel_id, knowledge_source, weight, evidence} 或 None。
+    """
+    result = conn.execute(
+        "MATCH (a:Concept)-[s:SYNAPSE]->(b:Concept) "
+        "WHERE a.id = $src AND b.id = $dst AND s.relation = $rel "
+        "AND s.status = 'CONFIRMED' "
+        "RETURN s.rel_id, s.knowledge_source, s.weight, s.evidence LIMIT 1",
+        {"src": src_id, "dst": dst_id, "rel": relation},
+    )
+    if not result.has_next():
+        return None
+    row = result.get_next()
+    return {"rel_id": row[0], "knowledge_source": row[1],
+            "weight": row[2], "evidence": row[3]}
+
+
 def get_synapse(conn, rel_id: str) -> Optional[dict]:
     """按 rel_id 精确读取单条突触；不存在返回 None。"""
     _validate_rel_id(rel_id)
     result = conn.execute(
         "MATCH (a:Concept)-[s:SYNAPSE]->(b:Concept) WHERE s.rel_id = $rid "
-        "RETURN a.id, b.id, s.weight, s.relation, s.evidence, s.status LIMIT 1",
+        "RETURN a.id, b.id, s.weight, s.relation, s.evidence, s.status, "
+        "s.knowledge_source LIMIT 1",
         {"rid": rel_id},
     )
     if not result.has_next():
@@ -465,6 +622,7 @@ def get_synapse(conn, rel_id: str) -> Optional[dict]:
         "relation": row[3],
         "evidence": row[4],
         "status": row[5],
+        "knowledge_source": row[6],
     }
 
 
@@ -581,7 +739,9 @@ def list_synapses(
 
     Returns:
         [{rel_id, src_id, src_name, dst_id, dst_name, relation,
-          weight, evidence, status}, ...]，按 rel_id 字典序稳定排序。
+          weight, evidence, status, knowledge_source}, ...]，
+        按 rel_id 字典序稳定排序。升级D：附 knowledge_source 供前端
+        渲染来源徽标（书籍/经验/手工/迁移），分级权限可视可查。
     """
     if status and status not in SYNAPSE_STATUSES:
         raise ValueError(f"非法 status 过滤值: {status!r}，仅允许 {SYNAPSE_STATUSES}")
@@ -595,7 +755,7 @@ def list_synapses(
         params["st"] = status
     cypher += (
         " RETURN s.rel_id, a.id, a.name, b.id, b.name,"
-        " s.relation, s.weight, s.evidence, s.status"
+        " s.relation, s.weight, s.evidence, s.status, s.knowledge_source"
         " ORDER BY s.rel_id LIMIT $lim"
     )
 
@@ -607,6 +767,7 @@ def list_synapses(
             "rel_id": r[0], "src_id": r[1], "src_name": r[2],
             "dst_id": r[3], "dst_name": r[4], "relation": r[5],
             "weight": float(r[6]), "evidence": r[7], "status": r[8],
+            "knowledge_source": r[9],
         })
     return rows
 
@@ -656,33 +817,37 @@ def get_confirmed_subgraph(conn) -> dict:
         高频安全调用。
 
     Returns:
-        {"nodes": [{id, name, category, description}, ...],
-         "edges": [{rel_id, src_id, dst_id, weight, relation, evidence}, ...]}
+        {"nodes": [{id, name, category, description, knowledge_source}, ...],
+         "edges": [{rel_id, src_id, dst_id, weight, relation, evidence,
+                    knowledge_source}, ...]}
         节点按首次出现去重，边按 rel_id 稳定排序，
         便于前端增量 diff 与推演引擎的确定性遍历。
     """
     result = conn.execute(
         "MATCH (a:Concept)-[s:SYNAPSE]->(b:Concept) WHERE s.status = 'CONFIRMED' "
-        "RETURN a.id, a.name, a.category, a.description, "
-        "b.id, b.name, b.category, b.description, "
-        "s.rel_id, s.weight, s.relation, s.evidence "
+        "RETURN a.id, a.name, a.category, a.description, a.knowledge_source, "
+        "b.id, b.name, b.category, b.description, b.knowledge_source, "
+        "s.rel_id, s.weight, s.relation, s.evidence, s.knowledge_source "
         "ORDER BY s.rel_id"
     )
     nodes: dict[str, dict] = {}
     edges: list[dict] = []
     while result.has_next():
         row = result.get_next()
-        src = {"id": row[0], "name": row[1], "category": row[2], "description": row[3]}
-        dst = {"id": row[4], "name": row[5], "category": row[6], "description": row[7]}
+        src = {"id": row[0], "name": row[1], "category": row[2],
+               "description": row[3], "knowledge_source": row[4]}
+        dst = {"id": row[5], "name": row[6], "category": row[7],
+               "description": row[8], "knowledge_source": row[9]}
         nodes.setdefault(src["id"], src)
         nodes.setdefault(dst["id"], dst)
         edges.append({
-            "rel_id": row[8],
+            "rel_id": row[10],
             "src_id": row[0],
-            "dst_id": row[4],
-            "weight": row[9],
-            "relation": row[10],
-            "evidence": row[11],
+            "dst_id": row[5],
+            "weight": row[11],
+            "relation": row[12],
+            "evidence": row[13],
+            "knowledge_source": row[14],
         })
     logger.debug("CONFIRMED 子图: %d 节点 / %d 边", len(nodes), len(edges))
     return {"nodes": list(nodes.values()), "edges": edges}
@@ -717,3 +882,47 @@ if __name__ == "__main__":
     result = session.get_kuzu().execute("CALL show_tables() RETURN *")
     while result.has_next():
         print(result.get_next())
+
+    # ── 升级D·前置：knowledge_source 端到端读写断言 ──
+    conn = session.get_kuzu()
+    ca = add_concept(conn, "ks_src_test", "测试源点", "症状",
+                     knowledge_source="manual")
+    cb = add_concept(conn, "ks_dst_test", "测试汇点", "证候")  # 缺省=intake
+    assert get_concept(conn, ca)["knowledge_source"] == "manual"
+    assert get_concept(conn, cb)["knowledge_source"] == "intake"
+
+    rid = add_synapse(conn, ca, cb, "causes", 0.8, "自检证据",
+                      status="CONFIRMED", knowledge_source="dialogue")
+    # 三个读取口逐口核验来源标记贯通
+    assert get_synapse(conn, rid)["knowledge_source"] == "dialogue"
+    listed = {r["rel_id"]: r for r in list_synapses(conn)}
+    assert listed[rid]["knowledge_source"] == "dialogue"
+    sub = get_confirmed_subgraph(conn)
+    edge = next(e for e in sub["edges"] if e["rel_id"] == rid)
+    assert edge["knowledge_source"] == "dialogue"
+    # 非法来源拦截（概念/突触双侧）
+    for bad_call in (
+        lambda: add_concept(conn, "ks_bad", "坏来源", "症状", knowledge_source="chat"),
+        lambda: add_synapse(conn, ca, cb, "causes", knowledge_source="chat"),
+    ):
+        try:
+            bad_call()
+            raise AssertionError("非法 knowledge_source 应拦截")
+        except ValueError as exc:
+            print("非法来源拦截 ✓ ", exc)
+    print("knowledge_source 端到端读写 ✓  concept/synapse/子图三口贯通")
+
+    # ── 升级D：知识类别分级助手 ──
+    # 映射正确性：intake/legacy→book，manual/dialogue→experience
+    assert knowledge_class("intake") == "book"
+    assert knowledge_class("legacy") == "book"
+    assert knowledge_class("manual") == "experience"
+    assert knowledge_class("dialogue") == "experience"
+    # 未知/空值从严判书籍类（分级权限安全取向：拿不准就禁改）
+    assert knowledge_class("") == "book"
+    assert knowledge_class("bogus") == "book"
+    assert knowledge_class(None) == "book"
+    assert is_book_class("intake") and is_book_class("legacy")
+    assert not is_book_class("dialogue") and not is_book_class("manual")
+    assert is_book_class("unknown_xyz"), "未知来源必须从严判书籍类"
+    print("知识类别分级 ✓  book={intake,legacy} / experience={manual,dialogue} / 未知从严")
